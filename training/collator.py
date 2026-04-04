@@ -47,17 +47,16 @@ class ChartCollator:
             log_mel[i, :, :T] = mel[:, :T]
 
         # ── Encoder padding mask [B, enc_max_len] ────────────────────────
-        # enc_max_len = 7 prefix tokens + enc_max_frames // 16 audio tokens
-        n_audio_tokens = self.enc_max_frames // 16
-        enc_max_len = 7 + n_audio_tokens                  # 519 (trimmed to 512 in model)
-        enc_max_len = min(enc_max_len, 512)
+        # The model hard-caps encoder sequence to enc_max_len=512.
+        # 7 prefix tokens are always valid → max audio tokens = 512 - 7 = 505.
+        enc_max_len = 512
+        max_audio_tokens = enc_max_len - 7  # 505
 
         enc_padding_mask = torch.zeros(B, enc_max_len, dtype=torch.bool)
         for i, item in enumerate(batch):
             T = item["log_mel"].shape[1]
-            filled_audio = min(T // 16, n_audio_tokens)
-            padded_audio = n_audio_tokens - filled_audio
-            # Mask the padded audio positions (prefix 7 tokens are always valid)
+            filled_audio = min(T // 16, max_audio_tokens)
+            # Mask positions beyond the actual audio tokens
             start_mask = 7 + filled_audio
             if start_mask < enc_max_len:
                 enc_padding_mask[i, start_mask:] = True

@@ -202,12 +202,19 @@ class ChartTransformer(nn.Module):
         memory_key_padding_mask: Optional[Tensor],
         tgt_key_padding_mask: Optional[Tensor],
     ) -> Tensor:
+        def make_layer_fn(layer):
+            def fn(x_, mem_, tgt_mask_):
+                return layer(
+                    x_, mem_,
+                    tgt_mask=tgt_mask_,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                )
+            return fn
+
         for i, layer in enumerate(self.decoder.layers):
             if i % self.config.dec_ckpt_every == 0:
-                x = checkpoint(
-                    layer, x, memory, tgt_mask, None, tgt_key_padding_mask, memory_key_padding_mask,
-                    use_reentrant=False,
-                )
+                x = checkpoint(make_layer_fn(layer), x, memory, tgt_mask, use_reentrant=False)
             else:
                 x = layer(
                     x, memory,

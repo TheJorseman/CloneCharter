@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
+
+# Ensure project root is on sys.path when running as a script
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from accelerate import Accelerator
