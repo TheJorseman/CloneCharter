@@ -270,7 +270,9 @@ class ChartTransformer(nn.Module):
 
     @classmethod
     def load(cls, path: str, map_location="cpu") -> "ChartTransformer":
-        ckpt = torch.load(path, map_location=map_location)
+        # weights_only=False needed because the checkpoint contains a ModelConfig dataclass.
+        # This is safe for our own checkpoints.
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
         model = cls(ckpt["config"])
         model.load_state_dict(ckpt["state_dict"])
         return model

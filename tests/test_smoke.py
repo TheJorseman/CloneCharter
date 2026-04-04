@@ -84,7 +84,7 @@ def make_fake_batch(B: int = 2, T: int = 256, seq_len: int = 50, device="cpu"):
         "difficulty_idx": torch.zeros(B, dtype=torch.long),
         "decoder_input_ids": token_ids[:, :-1].to(device),
         "decoder_labels": token_ids[:, 1:].to(device),
-        "decoder_attention_mask": torch.ones(B, seq_len + 1, dtype=torch.long),
+        "decoder_attention_mask": torch.ones(B, seq_len, dtype=torch.long),
     }
 
 
