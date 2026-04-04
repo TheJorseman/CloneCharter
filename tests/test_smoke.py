@@ -58,14 +58,17 @@ def check(condition: bool, msg: str):
 # ── Synthetic data helpers ────────────────────────────────────────────────────
 
 def make_fake_batch(B: int = 2, T: int = 256, seq_len: int = 50, device="cpu"):
-    """Build a fake collated batch with the shapes the model expects."""
+    """Build a fake collated batch with the shapes the model expects.
+
+    decoder_input_ids  = token_ids[:, :-1]  → shape (B, seq_len)
+    decoder_labels     = token_ids[:, 1:]   → shape (B, seq_len)
+    logits output      → shape (B, seq_len, vocab_size)
+    """
     tokenizer = CloneHeroTokenizer()
     bos = tokenizer.vocab["<BOS>"]
     eos = tokenizer.vocab["<EOS>"]
-    pad = tokenizer.vocab["<PAD>"]
-
-    # Random token sequences with BOS ... EOS
-    token_ids = torch.randint(4, tokenizer.vocab_size, (B, seq_len + 2))
+    # seq_len + 1 tokens so that input/labels are both exactly seq_len
+    token_ids = torch.randint(4, tokenizer.vocab_size, (B, seq_len + 1))
     token_ids[:, 0] = bos
     token_ids[:, -1] = eos
 
@@ -320,8 +323,12 @@ def test_training_step(device: str):
     ok(f"backward + optimizer step OK  ({loss_before:.4f} → {loss_after:.4f})")
 
 
-def test_save_load(device: str, tmp_path: str = "/tmp/charter_test.pt"):
+def test_save_load(device: str, tmp_path: str = None):
     section("Model save / load")
+    import tempfile, os
+    if tmp_path is None:
+        tmp_path = os.path.join(tempfile.gettempdir(), "charter_test.pt")
+
     cfg = ModelConfig(enc_layers=1, dec_layers=1, enc_ckpt_every=0, dec_ckpt_every=0)
     model = ChartTransformer(cfg).to(device)
     model.save(tmp_path)
