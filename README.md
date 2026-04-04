@@ -8,6 +8,11 @@ A transformer-based automatic charter for Clone Hero. This project processes Clo
 
 - [Project Overview](#project-overview)
 - [Repository Structure](#repository-structure)
+- [Quickstart](#quickstart)
+  - [Installation](#installation)
+  - [Download the Dataset](#download-the-dataset)
+  - [Training](#training)
+  - [Inference](#inference)
 - [Dataset Structure](#dataset-structure)
   - [clone\_hero\_dataset\_final/](#clone_hero_dataset_final)
   - [test\_dataset/](#test_dataset)
@@ -98,6 +103,173 @@ CloneCharter/
 ```
 
 > **Not tracked in git** (see `.gitignore`): the Arrow dataset (`clone_hero_dataset_final/`, ~74 GB), audio files, processing checkpoints, generated analysis outputs, and MIDI outputs.
+
+---
+
+## Quickstart
+
+### Installation
+
+```bash
+git clone https://github.com/thejorseman/CloneCharter.git
+cd CloneCharter
+pip install -r requirements.txt
+```
+
+### Download the Dataset
+
+The dataset (~74 GB, 158 Arrow shards, ~11,400 samples) is hosted on Hugging Face Hub at [`thejorseman/clone_hero_dataset`](https://huggingface.co/datasets/thejorseman/clone_hero_dataset).
+
+**Option A — Hugging Face Datasets library (recommended for training):**
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("thejorseman/clone_hero_dataset", split="train")
+```
+
+**Option B — Clone the full repository with Git LFS:**
+
+```bash
+# Install Git LFS first if you haven't:
+git lfs install
+
+git clone https://huggingface.co/datasets/thejorseman/clone_hero_dataset clone_hero_dataset_final
+```
+
+> The cloned folder should be placed at `clone_hero_dataset_final/` inside the project root (it is already in `.gitignore`).
+
+**Option C — Download individual shards with `huggingface_hub`:**
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="thejorseman/clone_hero_dataset",
+    repo_type="dataset",
+    local_dir="clone_hero_dataset_final",
+)
+```
+
+---
+
+### Training
+
+The model is an encoder-decoder transformer (~174M params) trained with HuggingFace Accelerate.
+
+**1. Smoke test (single GPU, no dataset needed — verifies the model and training loop):**
+
+```bash
+python tests/test_smoke.py
+# With GPU:
+python tests/test_smoke.py --device cuda
+```
+
+All 9 tests should pass. Initial loss should be ≈ 6.54 (= ln(693)).
+
+**2. Debug run (single GPU, real dataset, 10 steps):**
+
+```bash
+python training/train.py --debug --dataset_path clone_hero_dataset_final
+```
+
+This verifies the dataset loading and full forward/backward pass on your local GPU before launching a full run.
+
+**3. Full training on 8 × H100 (or any multi-GPU setup):**
+
+```bash
+accelerate launch \
+    --num_processes 8 \
+    --mixed_precision bf16 \
+    training/train.py \
+    --dataset_path clone_hero_dataset_final \
+    --checkpoint_dir model_checkpoints
+```
+
+Key hyperparameters (set in `training/config.py`):
+
+| Parameter | Value |
+|---|---|
+| Per-GPU batch size | 4 |
+| Gradient accumulation | 8 |
+| Effective batch size | 4 × 8 × 8 GPUs = **256** |
+| Learning rate | 3e-4 (AdamW) |
+| LR schedule | Cosine with 500 warmup steps |
+| Epochs | 150 (~6,600 steps) |
+| Mixed precision | bf16 |
+| Checkpoint every | 500 steps |
+
+**Resume from checkpoint:**
+
+```bash
+accelerate launch --num_processes 8 --mixed_precision bf16 \
+    training/train.py \
+    --dataset_path clone_hero_dataset_final \
+    --resume model_checkpoints/step_005000
+```
+
+**W&B logging** is enabled by default when `wandb` is installed. Disable with `--no_wandb`.
+
+---
+
+### Inference
+
+Generate a `notes.chart` file from any audio file:
+
+```bash
+python inference/pipeline.py \
+    --audio path/to/song.mp3 \
+    --instrument Single \
+    --difficulty Expert \
+    --checkpoint model_checkpoints/step_005000 \
+    --output notes.chart
+```
+
+**Arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--audio` | required | Input audio file (mp3, ogg, wav, flac) |
+| `--instrument` | `Single` | `Single` · `DoubleBass` · `Drums` · `DoubleRhythm` · `GuitarCoop` |
+| `--difficulty` | `Expert` | `Expert` · `Hard` · `Medium` · `Easy` |
+| `--checkpoint` | required | Path to a saved model checkpoint directory |
+| `--output` | `notes.chart` | Output `.chart` file path |
+| `--bpm` | auto-detected | Override BPM detection |
+| `--beam_size` | `4` | Beam search width (1 = greedy) |
+| `--device` | auto | `cpu` or `cuda` |
+
+**What happens under the hood:**
+
+```
+audio file
+   │
+   ├─ 1. Demucs stem separation  (guitar / bass / drums extracted)
+   ├─ 2. Log-mel spectrogram     [512, T] from relevant stem
+   ├─ 3. MERT embedding          [768] from original audio
+   ├─ 4. BPM detection           (librosa, or --bpm override)
+   ├─ 5. Transformer encoder     enc_out [1, 512, 768]
+   ├─ 6. Beam search decoder     token_ids  (up to 2044 tokens)
+   └─ 7. Chart serialization     [Song] / [SyncTrack] / [ExpertSingle]
+```
+
+**Python API:**
+
+```python
+from inference.pipeline import ChartGenerationPipeline
+
+pipeline = ChartGenerationPipeline(checkpoint_path="model_checkpoints/step_005000")
+
+chart_str = pipeline.generate(
+    audio_path="song.mp3",
+    instrument="Single",   # "Single" | "DoubleBass" | "Drums"
+    difficulty="Expert",   # "Expert" | "Hard" | "Medium" | "Easy"
+    bpm=120.0,             # optional — auto-detected if None
+    beam_size=4,
+)
+
+with open("notes.chart", "w") as f:
+    f.write(chart_str)
+```
 
 ---
 

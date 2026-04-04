@@ -335,6 +335,7 @@ def test_save_load(device: str, tmp_path: str = None):
     ok(f"saved to {tmp_path}")
 
     loaded = ChartTransformer.load(tmp_path, map_location=device)
+    model.eval().to(device)
     loaded.eval().to(device)
 
     batch = move_batch(make_fake_batch(B=1, T=64, seq_len=10), device)
