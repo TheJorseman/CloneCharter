@@ -3,6 +3,36 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# ── Project-specific ─────────────────────────────────────────────────────────
+
+# Datasets (large Arrow shards, ~74 GB)
+clone_hero_dataset_final/
+clone_hero_dataset_final.csv
+clone_hero_dataset*/
+
+# Large analysis / intermediate outputs
+chart_analysis_results.json
+data_analisis/
+error_log.txt
+notas.txt
+
+# Training & processing state
+checkpoints/
+model_checkpoints/
+output_stems/
+
+# Root-level audio / binary test files (use test_dataset/ for samples)
+/*.mp3
+/*.wav
+/*.ogg
+/*.npy
+
+# Generated MIDI and chart outputs
+/ejemplo_creado.mid
+/notes.mid
+
+# ── Generic Python ────────────────────────────────────────────────────────────
+test/
 # C extensions
 *.so
 

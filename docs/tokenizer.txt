@@ -1,0 +1,31 @@
+BOS
+EOS
+PAD
+Instrument [Guitar, DoubleBass, Drums]
+Difficulty [Expert, Hard, Medium, Easy]
+Pitch0,1,...,7
+DrumsPitch 0,..4
+Special
+DurationM 0-120
+DurationB 
+
+
+Tiempo (segundos) = (Ticks ÷ Resolution) × (60 ÷ BPM) + Offset
+
+Ticks = ((Tiempo (segundos) - Offset) / (60 / BPM) ) * Resolution
+-------------------------------------------- Cuantos segundos hay en 1 beat
+---------------------      En que espacio de tiempo estamos
+
+60 s ---------- 120 BPM
+    ------------  1 bpm
+
+
+
+Minutes, Beat, ShiftBeats (32)
+
+BPM: 160
+BPM_sec 0.375
+
+490.3125s ----> 8, 
+10.3125   ----> 27
+0.5------------ 16
