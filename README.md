@@ -1,4 +1,4 @@
-# auto-charter — Clone Hero Auto-Charting Pipeline
+# CloneCharter — Clone Hero Auto-Charting Pipeline
 
 A complete pipeline for building HuggingFace datasets from Clone Hero charts **and training a Transformer model** to generate new charts from audio.
 
@@ -9,8 +9,8 @@ A complete pipeline for building HuggingFace datasets from Clone Hero charts **a
 Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/thejorseman/auto-charter
-cd auto-charter
+git clone https://github.com/thejorseman/CloneCharter
+cd CloneCharter
 
 # Install all dependencies (CUDA 12.8 PyTorch + Demucs + MERT + training stack)
 uv sync
@@ -40,6 +40,11 @@ uv run process-dataset \
   --separate-stems \
   --device cuda
 ```
+
+Or Download 
+
+https://huggingface.co/datasets/thejorseman/CloneHeroCharts
+
 
 ### 2. Train the model
 
@@ -425,10 +430,10 @@ If you use this in research, cite:
 
 ```bibtex
 @software{auto_charter_2025,
-  title={Auto-Charter: Clone Hero Song Tokenization & Dataset Pipeline},
+  title={CloneCharter: Clone Hero Song Tokenization & Dataset Pipeline},
   author={[thejorseman]},
   year={2025},
-  url={https://github.com/thejorseman/auto-charter}
+  url={https://github.com/thejorseman/CloneCharter}
 }
 ```
 
