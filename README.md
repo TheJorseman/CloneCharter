@@ -1,571 +1,454 @@
-# CloneCharter
+# auto-charter — Clone Hero Auto-Charting Pipeline
 
-A transformer-based automatic charter for Clone Hero. This project processes Clone Hero song charts (`.chart` files) and their associated audio to build a large-scale machine learning dataset for training a model that can automatically generate rhythm game charts from audio.
-
----
-
-## Table of Contents
-
-- [Project Overview](#project-overview)
-- [Repository Structure](#repository-structure)
-- [Quickstart](#quickstart)
-  - [Installation](#installation)
-  - [Download the Dataset](#download-the-dataset)
-  - [Training](#training)
-  - [Inference](#inference)
-- [Dataset Structure](#dataset-structure)
-  - [clone\_hero\_dataset\_final/](#clone_hero_dataset_final)
-  - [test\_dataset/](#test_dataset)
-  - [Song Folder Format](#song-folder-format)
-- [File Formats](#file-formats)
-  - [.chart Format](#chart-format)
-  - [.mid Format](#mid-format)
-- [Tokenizer](#tokenizer)
-- [Processing Pipeline](#processing-pipeline)
-- [Key Scripts](#key-scripts)
-- [Models & Utilities](#models--utilities)
-- [Technologies](#technologies)
+A complete pipeline for building HuggingFace datasets from Clone Hero charts **and training a Transformer model** to generate new charts from audio.
 
 ---
 
-## Project Overview
+## Installation
 
-The goal is to create an AI system that takes raw audio as input and outputs a valid Clone Hero chart. The pipeline:
-
-1. **Parse** Clone Hero song folders (`.chart` + audio)
-2. **Tokenize** the chart data into a structured sequence
-3. **Embed** the audio using MERT (music transformer)
-4. **Separate** audio into stems (drums, bass, vocals, other) using Demucs
-5. **Store** everything as a Hugging Face Arrow dataset (~74 GB)
-6. **Train** a transformer model on the resulting dataset
-
-The dataset is published to the Hugging Face Hub at `thejorseman/clone_hero_dataset`.
-
----
-
-## Repository Structure
-
-```
-CloneCharter/
-├── data/                           # Data loading modules
-│   ├── chart_loader.py             # CloneHeroChartParser — parses .chart files
-│   ├── audio_loaders.py            # AudioProcessor — loads and processes audio
-│   └── midi_loader.py              # MIDIProcessor — loads and creates MIDI files
-│
-├── models/                         # ML model wrappers
-│   ├── tokenizer.py                # CloneHeroTokenizer (HuggingFace PreTrainedTokenizer)
-│   ├── demucs.py                   # DemucsAudioSeparator — stem separation
-│   └── mert.py                     # MERT — music audio embeddings
-│
-├── utils/                          # Shared utilities
-│   ├── time_utils.py               # BPM / tick / second conversion functions
-│   └── audio_utils.py              # Musical data interpolation for NN input
-│
-├── training/                       # Transformer training code (see plan)
-│   ├── config.py                   # TrainingConfig + ModelConfig dataclasses
-│   ├── dataset.py                  # CloneHeroDataset — song-level train/val split
-│   ├── collator.py                 # ChartCollator — dynamic padding + masks
-│   ├── train.py                    # Main loop (HuggingFace Accelerate, 8-GPU DDP)
-│   └── metrics.py                  # Perplexity, Token Acc, Note F1, Timing Acc
-│
-├── inference/                      # Inference pipeline
-│   ├── generate.py                 # Beam search + greedy decode
-│   └── pipeline.py                 # ChartGenerationPipeline: audio → notes.chart
-│
-├── scripts/                        # Data pipeline & analysis scripts
-│   ├── tokenize_chart_dataset.py   # Main pipeline — processes charts → Arrow dataset
-│   ├── parse_all_songs.py          # Scans folders, builds chart_analysis_results.json
-│   ├── merge_dataset.py            # Merges dataset shards and uploads to HF Hub
-│   ├── migrate_pickle.py           # Converts legacy pickle files to Arrow format
-│   ├── data_anal.py                # Chart analysis and Plotly visualizations
-│   └── duration_anal.py            # Note duration histogram analysis
-│
-├── tests/                          # Unit & integration tests
-│   ├── test_chart_loader.py
-│   ├── test_tokenizer.py
-│   ├── test_bpm.py
-│   ├── test_separator.py
-│   └── ...
-│
-├── samples/                        # Example chart files for reference
-│   ├── notes.chart                 # Full multi-difficulty guitar chart
-│   ├── notes_drums.chart           # Complex drums chart
-│   ├── nueva_cancion.chart         # Minimal chart skeleton
-│   └── song.ini                    # Song metadata example
-│
-├── docs/
-│   └── tokenizer.txt               # Token vocabulary reference
-│
-└── test_dataset/                   # 3 complete songs for local testing
-    ├── Caos - La Planta/
-    ├── El Precio de la Soledad/
-    └── Grupo Marca Registrada - El Rescate/
-```
-
-> **Not tracked in git** (see `.gitignore`): the Arrow dataset (`clone_hero_dataset_final/`, ~74 GB), audio files, processing checkpoints, generated analysis outputs, and MIDI outputs.
-
----
-
-## Quickstart
-
-### Installation
+Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/thejorseman/CloneCharter.git
-cd CloneCharter
-pip install -r requirements.txt
+git clone https://github.com/thejorseman/auto-charter
+cd auto-charter
+
+# Install all dependencies (CUDA 12.8 PyTorch + Demucs + MERT + training stack)
+uv sync
+
+# Activate the virtual environment
+source .venv/bin/activate          # Linux/macOS
+# or: .venv\Scripts\activate       # Windows
+
+# Verify installation
+uv run pytest tests/ -v
 ```
 
-### Download the Dataset
+**GPU support:** The project targets CUDA 12.8 by default (H100 / RTX 40/50 series). If you use a different CUDA version, edit the `[tool.uv.index]` in `pyproject.toml` before running `uv sync`.
 
-The dataset (~74 GB, 158 Arrow shards, ~11,400 samples) is hosted on Hugging Face Hub at [`thejorseman/clone_hero_dataset`](https://huggingface.co/datasets/thejorseman/clone_hero_dataset).
+---
 
-**Option A — Hugging Face Datasets library (recommended for training):**
+## Quick Start
+
+### 1. Build a dataset
+
+```bash
+uv run process-dataset \
+  -i /path/to/clone_hero_songs/ \
+  -o ./my_dataset/ \
+  --extract-logmel \
+  --extract-mert \
+  --separate-stems \
+  --device cuda
+```
+
+### 2. Train the model
+
+```bash
+# Configure accelerate once (choose bf16 for H100, fp16 for RTX)
+accelerate config
+
+# Train (single GPU)
+accelerate launch src/auto_charter/scripts/train.py \
+  --dataset ./my_dataset/ \
+  --output-dir ./checkpoints/run1 \
+  --batch-size 4 --grad-accum 4 --num-epochs 100
+
+# Train (8× H100)
+accelerate launch --num_processes 8 --multi_gpu \
+  src/auto_charter/scripts/train.py \
+  --dataset ./my_dataset/ --output-dir ./checkpoints/run1
+```
+
+### 3. Validate
+
+```bash
+uv run validate-charter \
+  --checkpoint ./checkpoints/run1/best \
+  --dataset ./my_dataset/ \
+  --output-json metrics.json
+```
+
+### 4. Generate a chart (Gradio demo)
+
+```bash
+uv run demo-charter --checkpoint ./checkpoints/run1/best --port 7860
+# Open http://localhost:7860
+# Upload a song → select instrument + difficulty → download .zip
+```
+
+---
+
+## Quick Example (Python API)
+
+```bash
+# Build a dataset with log-mel spectrograms
+uv run process-dataset \
+  -i /path/to/clone_hero_songs/ \
+  -o ./my_dataset/ \
+  --extract-logmel
+
+# Push to HuggingFace Hub
+uv run process-dataset \
+  -i /path/to/songs/ \
+  --push-to-hub username/clone-hero-charts \
+  --extract-logmel --device cuda
+```
+
+Load and train:
 
 ```python
 from datasets import load_dataset
+from auto_charter.dataset.collator import AutoCharterCollator
+from torch.utils.data import DataLoader
 
-ds = load_dataset("thejorseman/clone_hero_dataset", split="train")
+ds = load_dataset("username/clone-hero-charts")
+collator = AutoCharterCollator(max_tokens=8192, return_tensors="pt")
+loader = DataLoader(ds["train"], batch_size=4, collate_fn=collator)
+
+# Ready to feed into a transformer!
+for batch in loader:
+    # batch["input_ids"]: [B, T] token IDs
+    # batch["mert_embeddings"]: [B, num_beats, 768]
+    # batch["logmel_frames"]: [B, num_beats, 32, 128]
+    pass
 ```
 
-**Option B — Clone the full repository with Git LFS:**
+---
 
-```bash
-# Install Git LFS first if you haven't:
-git lfs install
+## Features
 
-git clone https://huggingface.co/datasets/thejorseman/clone_hero_dataset clone_hero_dataset_final
-```
+✅ **Chart Parsing** — `.chart` and `.mid` formats, variable BPM + time signatures
+✅ **Event-Based Tokenization** — 187-token vocabulary, handles chords/sustains/modifiers
+✅ **Beat-Level Audio Conditioning** — MERT embeddings + log-mel spectrograms
+✅ **Automatic Stem Separation** — Demucs htdemucs for instrument isolation from mixes
+✅ **HuggingFace Integration** — Arrow datasets, Hub push/pull, standard schema
+✅ **Round-Trip Reversibility** — encode → decode → re-encode produces identical tokens
+✅ **Comprehensive Testing** — 39 unit tests, all test songs verified
 
-> The cloned folder should be placed at `clone_hero_dataset_final/` inside the project root (it is already in `.gitignore`).
+---
 
-**Option C — Download individual shards with `huggingface_hub`:**
+## Core Modules
+
+### Vocabulary (`auto_charter.vocab`)
+- **tokens.py** — 187 token IDs: WAIT, NOTE, DRUM, SUS, BEAT_BOUNDARY, SP_ON/OFF, etc.
+- **guitar_vocab.py** — chord bitmask encoding (31 lane combinations)
+- **drum_vocab.py** — drum hit bitmasks (5 lanes, no sustain)
+
+### Parsing (`auto_charter.parsers`)
+- **chart_parser.py** — `.chart` file parsing with [SyncTrack] (BPM/time-sig) support
+- **midi_parser.py** — `.mid` parsing with tick normalization to resolution=192
+- **ini_parser.py** — song.ini metadata extraction
+- **sync_track.py** — BPM mapping, tick↔seconds conversion, beat grid generation
+
+### Tokenization (`auto_charter.tokenizer`)
+- **encoder.py** — chart → token sequence (autoregressive, deterministic)
+- **decoder.py** — token sequence → chart (reversible)
+- **quantize.py** — 16-tick grid snapping, sustain quantization
+
+### Audio (`auto_charter.audio`)
+- **stem_loader.py** — resolve dedicated stems or fall back to mix
+- **separator.py** — Demucs htdemucs wrapper for automatic stem separation
+- **mert_extractor.py** — MERT hidden states → [num_beats, 768]
+- **logmel.py** — log-mel spectrogram → [num_beats, 32, 128] (resampled per beat)
+- **beat_aligner.py** — slice/resample audio features to beat boundaries
+- **beat_estimator.py** — librosa-based beat detection for inference-time use
+
+### Model (`auto_charter.model`)
+- **config.py** — `AutoCharterConfig` dataclass (hyperparameters, save/load)
+- **audio_encoder.py** — `AudioEncoder`: MERT + LogMel + BPM + time-sig → Transformer encoder
+- **token_decoder.py** — `AutoregressiveDecoder`: causal decoder with beat-distance cross-attention bias
+- **charter_model.py** — `AutoCharterModel`: full encoder-decoder, `.generate()`, `.save_pretrained()`
+
+### Training (`auto_charter.training`)
+- **dataset.py** — `AutoCharterDataset`: filters missing audio, stratified 80/20 split by instrument
+- **collator.py** — `AutoCharterTrainCollator`: computes `beat_ids`, instrument/difficulty tensors, beat timing
+- **metrics.py** — token accuracy, perplexity, note-level F1, beat accuracy
+- **trainer.py** — `AutoCharterTrainer`: Accelerate loop, early stopping, TensorBoard/W&B logging
+
+### Dataset (`auto_charter.dataset`)
+- **schema.py** — HuggingFace Features definition (30 fields)
+- **builder.py** — SongProcessor: song folder → dataset rows (with stats computation)
+- **collator.py** — AutoCharterCollator: batching + padding for training
+
+### Scripts (`auto_charter.scripts`)
+- **process-dataset** — main CLI: multiple input folders → HuggingFace dataset
+- **inspect-song** — debug: print human-readable token traces
+- **validate-roundtrip** — verify encode↔decode reversibility
+- **train-charter** — train `AutoCharterModel` with Accelerate (single/multi-GPU)
+- **validate-charter** — evaluate on test split, print per-instrument metrics table
+- **demo-charter** — Gradio demo: upload audio → generate chart → download .zip
+
+---
+
+## Quantization & Vocabulary
+
+**16-tick grid** handles all observed note spacings:
+
+| Subdivision    | Ticks | Appears in dataset |
+|---|---|---|
+| Quarter note   | 192   | ✓ (base beat) |
+| 8th note       | 96    | ✓ |
+| 16th note      | 48    | ✓ |
+| 16th triplet   | 32    | ✓ **Critical** (sierreño) |
+| 32nd note      | 24    | ✓ |
+
+**Token vocabulary** (187 IDs):
+
+- **0–5** — Special: PAD, BOS, EOS, UNK, BEAT_BOUNDARY, MEASURE_START
+- **6–8** — Instrument: GUITAR, BASS, DRUMS
+- **9–56** — WAIT_k (k=1..48, advances by k×16 ticks)
+- **57–87** — Guitar/bass chords (31 lane bitmasks: 0b00000–0b11111)
+- **88–91** — Modifiers: HOPO, TAP, OPEN, FORCE_STRUM
+- **92–122** — Drum chords (31 bitmasks, no sustain)
+- **123–182** — Sustain durations (60 steps: 0–752 ticks linear, 864–2640 coarse)
+- **183–186** — Events: STAR_POWER_ON/OFF, SOLO_ON/OFF
+
+---
+
+## Example Dataset Structure
+
+One row per instrument per song:
 
 ```python
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    repo_id="thejorseman/clone_hero_dataset",
-    repo_type="dataset",
-    local_dir="clone_hero_dataset_final",
-)
-```
-
----
-
-### Training
-
-The model is an encoder-decoder transformer (~174M params) trained with HuggingFace Accelerate.
-
-**1. Smoke test (single GPU, no dataset needed — verifies the model and training loop):**
-
-```bash
-python tests/test_smoke.py
-# With GPU:
-python tests/test_smoke.py --device cuda
-```
-
-All 9 tests should pass. Initial loss should be ≈ 6.54 (= ln(693)).
-
-**2. Debug run (single GPU, real dataset, 10 steps):**
-
-```bash
-python training/train.py --debug --dataset_path clone_hero_dataset_final
-```
-
-This verifies the dataset loading and full forward/backward pass on your local GPU before launching a full run.
-
-**3. Full training on 8 × H100 (or any multi-GPU setup):**
-
-```bash
-accelerate launch \
-    --num_processes 8 \
-    --mixed_precision bf16 \
-    training/train.py \
-    --dataset_path clone_hero_dataset_final \
-    --checkpoint_dir model_checkpoints
-```
-
-Key hyperparameters (set in `training/config.py`):
-
-| Parameter | Value |
-|---|---|
-| Per-GPU batch size | 4 |
-| Gradient accumulation | 8 |
-| Effective batch size | 4 × 8 × 8 GPUs = **256** |
-| Learning rate | 3e-4 (AdamW) |
-| LR schedule | Cosine with 500 warmup steps |
-| Epochs | 150 (~6,600 steps) |
-| Mixed precision | bf16 |
-| Checkpoint every | 500 steps |
-
-**Resume from checkpoint:**
-
-```bash
-accelerate launch --num_processes 8 --mixed_precision bf16 \
-    training/train.py \
-    --dataset_path clone_hero_dataset_final \
-    --resume model_checkpoints/step_005000
-```
-
-**W&B logging** is enabled by default when `wandb` is installed. Disable with `--no_wandb`.
-
----
-
-### Inference
-
-Generate a `notes.chart` file from any audio file:
-
-```bash
-python inference/pipeline.py \
-    --audio path/to/song.mp3 \
-    --instrument Single \
-    --difficulty Expert \
-    --checkpoint model_checkpoints/step_005000 \
-    --output notes.chart
-```
-
-**Arguments:**
-
-| Argument | Default | Description |
-|---|---|---|
-| `--audio` | required | Input audio file (mp3, ogg, wav, flac) |
-| `--instrument` | `Single` | `Single` · `DoubleBass` · `Drums` · `DoubleRhythm` · `GuitarCoop` |
-| `--difficulty` | `Expert` | `Expert` · `Hard` · `Medium` · `Easy` |
-| `--checkpoint` | required | Path to a saved model checkpoint directory |
-| `--output` | `notes.chart` | Output `.chart` file path |
-| `--bpm` | auto-detected | Override BPM detection |
-| `--beam_size` | `4` | Beam search width (1 = greedy) |
-| `--device` | auto | `cpu` or `cuda` |
-
-**What happens under the hood:**
-
-```
-audio file
-   │
-   ├─ 1. Demucs stem separation  (guitar / bass / drums extracted)
-   ├─ 2. Log-mel spectrogram     [512, T] from relevant stem
-   ├─ 3. MERT embedding          [768] from original audio
-   ├─ 4. BPM detection           (librosa, or --bpm override)
-   ├─ 5. Transformer encoder     enc_out [1, 512, 768]
-   ├─ 6. Beam search decoder     token_ids  (up to 2044 tokens)
-   └─ 7. Chart serialization     [Song] / [SyncTrack] / [ExpertSingle]
-```
-
-**Python API:**
-
-```python
-from inference.pipeline import ChartGenerationPipeline
-
-pipeline = ChartGenerationPipeline(checkpoint_path="model_checkpoints/step_005000")
-
-chart_str = pipeline.generate(
-    audio_path="song.mp3",
-    instrument="Single",   # "Single" | "DoubleBass" | "Drums"
-    difficulty="Expert",   # "Expert" | "Hard" | "Medium" | "Easy"
-    bpm=120.0,             # optional — auto-detected if None
-    beam_size=4,
-)
-
-with open("notes.chart", "w") as f:
-    f.write(chart_str)
-```
-
----
-
-## Dataset Structure
-
-### `clone_hero_dataset_final/`
-
-The final processed dataset in [Apache Arrow](https://arrow.apache.org/) format (Hugging Face Datasets).
-
-```
-clone_hero_dataset_final/
-├── dataset_info.json               # Schema and feature definitions
-├── state.json                      # Dataset state metadata
-├── data-00000-of-00158.arrow       # Shard 0
-├── data-00001-of-00158.arrow       # Shard 1
-│   ...
-└── data-00157-of-00158.arrow       # Shard 157 (total ~74 GB)
-```
-
-| Property | Value |
-|---|---|
-| Format | Apache Arrow (Hugging Face Datasets) |
-| Shards | 158 files |
-| Total Size | ~74 GB |
-| HF Hub | `thejorseman/clone_hero_dataset` |
-
-Each record in the dataset represents a tokenized chart track and includes:
-- Tokenized chart sequence (instrument, difficulty, notes, timing)
-- Audio embeddings extracted by MERT
-- Song metadata (BPM, time signature, resolution, offset)
-
-Processing progress is saved to `checkpoints/checkpoint_metadata.json` so runs can be resumed.
-
----
-
-### `test_dataset/`
-
-Three complete Clone Hero song folders used for development and testing:
-
-```
-test_dataset/
-├── Caos - La Planta/
-│   ├── notes.chart
-│   ├── song.ini
-│   ├── song.ogg
-│   └── album.png
-│
-├── El Precio de la Soledad/
-│   ├── notes.chart
-│   ├── song.ini
-│   ├── song.ogg
-│   └── album.png
-│
-└── Grupo Marca Registrada - El Rescate/
-    ├── notes.chart
-    ├── song.ini
-    ├── guitar.ogg
-    ├── bass.ogg
-    ├── vocals.ogg
-    └── album.png
-```
-
-| Song | Genre | Length |
-|---|---|---|
-| Caos - La Planta | Rock | ~249 s |
-| El Precio de la Soledad | Banda | ~185 s |
-| Grupo Marca Registrada - El Rescate | Sierreño | ~161 s |
-
----
-
-### Song Folder Format
-
-Each song in the source dataset follows the standard Clone Hero layout:
-
-```
-Song Name - Artist/
-├── notes.chart       # Required — the rhythm chart
-├── song.ini          # Required — metadata
-├── song.ogg          # Audio (single mix) OR separated stems:
-├── guitar.ogg        # Guitar stem
-├── bass.ogg          # Bass stem
-├── vocals.ogg        # Vocals stem
-├── drums.ogg         # Drums stem
-└── album.png         # Optional — cover art
-```
-
-**`song.ini` fields:**
-
-```ini
-[song]
-name = Song Title
-artist = Artist Name
-charter = Charter Name
-album = Album Name
-year = 2022
-genre = Rock
-song_length = 249195    # milliseconds
-diff_guitar = 3         # 0–6 difficulty (-1 = not charted)
-diff_bass = 2
-diff_drums = 4
-diff_keys = -1
-```
-
----
-
-## File Formats
-
-### `.chart` Format
-
-Text-based format with INI-like sections. The Clone Hero chart format stores all timing and note data.
-
-**Top-level sections:**
-
-| Section | Description |
-|---|---|
-| `[Song]` | Metadata: name, artist, BPM, resolution, audio file paths |
-| `[SyncTrack]` | Tempo map (BPM changes) and time signature changes |
-| `[Events]` | Section markers and lyrics |
-| `[ExpertSingle]` | Expert guitar/keys notes |
-| `[HardSingle]` | Hard guitar/keys notes |
-| `[MediumSingle]` | Medium guitar/keys notes |
-| `[EasySingle]` | Easy guitar/keys notes |
-| `[ExpertDoubleBass]` | Expert bass notes |
-| `[ExpertDrums]` | Expert drum notes |
-
-**`[Song]` block:**
-
-```
-[Song]
 {
-  Name = "Song Title"
-  Artist = "Artist Name"
-  Charter = "Charter Name"
-  Resolution = 192        # Ticks per quarter note
-  Offset = 0              # Audio sync offset (seconds)
-  GuitarStream = "guitar.ogg"
-  BassStream = "bass.ogg"
-  MusicStream = "song.ogg"
+  "song_id": "a3f9b1c2d0e4...",
+  "instrument": "guitar",
+  "source_format": "chart",
+
+  "tokens": [1, 6, 4, 17, 183, 11, 60, 123, 91, ...],  # [T]
+  "num_tokens": 3231,
+  "num_beats": 396,
+
+  "mert_embeddings": [...],     # [396, 768] float32
+  "logmel_frames": [...],       # [396, 32, 128] float32
+
+  "beat_times_s": [0.0, 0.462, 0.923, ...],
+  "beat_durations_s": [0.462, ...],
+  "bpm_at_beat": [130.0, ...],
+
+  "song_name": "El Precio de la Soledad",
+  "artist": "Alfredo Olivas",
+  "genre": "banda",
+  "charter": "Spidey_3089",
+  "year": 2012,
+  "song_length_ms": 184668,
+  "difficulty": 2,
+
+  "has_star_power": true,
+  "has_solo": true,
+  "has_dedicated_stem": false,
+
+  "num_notes": 640,
+  "notes_per_beat_mean": 1.62,
+  "chord_ratio": 0.0,
+  "bpm_mean": 130.0,
+  "bpm_std": 0.0,
 }
 ```
 
-**`[SyncTrack]` block — timing events at tick positions:**
+---
 
+## Commands
+
+```bash
+# Build dataset from song folders
+uv run process-dataset -i songs1/ -i songs2/ -o ./dataset/ \
+    --extract-logmel --extract-mert --device cuda
+
+# Train model (configure accelerate first: accelerate config)
+accelerate launch src/auto_charter/scripts/train.py \
+    --dataset ./dataset/ --output-dir ./runs/run1
+
+# Evaluate on test split
+uv run validate-charter --checkpoint ./runs/run1/best --dataset ./dataset/
+
+# Launch Gradio demo
+uv run demo-charter --checkpoint ./runs/run1/best
+
+# Debug: print token traces for inspection
+uv run inspect-song "path/to/song/" --instrument guitar
+
+# Verify: encode→decode→re-encode roundtrip test
+uv run validate-roundtrip test_dataset/
 ```
-[SyncTrack]
-{
-  0 = TS 4          # Time Signature: 4/4 (numerator only; denominator = 4)
-  0 = B 120000      # Tempo: BPM × 1000 → 120.000 BPM
-  768 = B 116753    # Tempo change at tick 768 → 116.753 BPM
-  768 = TS 3        # Time signature change to 3/4
-}
-```
-
-**Tick ↔ Time conversion:**
-
-```
-time_seconds = (tick / Resolution) × (60 / BPM) + Offset
-tick         = ((time_seconds − Offset) / (60 / BPM)) × Resolution
-```
-
-**Note tracks — `[ExpertSingle]`, `[ExpertDrums]`, etc.:**
-
-```
-[ExpertSingle]
-{
-  1536 = N 2 0      # Note at tick 1536, pitch 2, sustain 0 ticks
-  1920 = N 0 192    # Note at tick 1920, pitch 0, held for 192 ticks
-  3456 = S 2 0      # Special note (Star Power) at tick 3456
-}
-```
-
-**Guitar/Bass pitch values:**
-
-| Value | Color |
-|---|---|
-| 0 | Green |
-| 1 | Red |
-| 2 | Yellow |
-| 3 | Blue |
-| 4 | Orange |
-| 5–7 | Extended colors |
-
-**Drums pitch values:**
-
-| Value | Drum |
-|---|---|
-| 0 | Kick |
-| 1 | Red (snare) |
-| 2 | Yellow (hi-hat) |
-| 3 | Blue (tom) |
-| 4 | Orange (cymbal) |
 
 ---
 
-### `.mid` Format
+## Documentation
 
-Standard MIDI binary format, used as an alternative chart representation. Handled by `data/midi_loader.py` (`MIDIProcessor` class).
-
-| Parameter | Default |
-|---|---|
-| `ticks_per_beat` | 480 |
-| MIDI type | 0, 1, or 2 |
-| Pitch range | 0–127 (MIDI standard) |
+- **[TOKENIZATION.md](TOKENIZATION.md)** — Complete tokenization guide with examples from real songs
+- **[PROCESS_DATASET.md](PROCESS_DATASET.md)** — Command reference, workflows, troubleshooting
+- **README.MD** (in parent) — Clone Hero chart format (.chart, .mid, song.ini) specification
 
 ---
 
-## Tokenizer
+## Testing
 
-The `CloneHeroTokenizer` (in `models/tokenizer.py`) converts a parsed chart into a sequence of tokens suitable for a language model. It extends HuggingFace's `PreTrainedTokenizer`.
+```bash
+# Run all tests (39 passed)
+uv run pytest tests/ -v
 
-**Vocabulary:**
+# Specific test
+uv run pytest tests/test_tokenizer.py::test_roundtrip_guitar -v
 
-| Token group | Tokens |
-|---|---|
-| Special | `<BOS>`, `<EOS>`, `<UNK>`, `<PAD>` |
-| Instruments | `<Guitar>`, `<Bass>`, `<Drums>` |
-| Difficulties | `<Expert>`, `<Hard>`, `<Medium>`, `<Easy>` |
-| Timing — minute | `<Minute_0>` … `<Minute_120>` |
-| Timing — beat | `<Beat_0>` … `<Beat_512>` |
-| Timing — beatshift | `<Beatshift_0>` … `<Beatshift_32>` |
-| Guitar/Bass pitches | `<Pitch_0>` … `<Pitch_7>` |
-| Drums pitches | `<DrumsPitch_0>` … `<DrumsPitch_4>` |
+# With coverage
+uv run pytest tests/ --cov=auto_charter
+```
 
-**Configuration:**
+**Test coverage:**
+- Chart parsing (format, BPM/time-sig, events)
+- MIDI normalization (tick conversion, pitch maps)
+- Tokenization (vocab, encoding, decoding, round-trips)
+- Audio extraction shapes (MERT, log-mel, beat alignment)
+
+---
+
+## Example Workflows
+
+### Scenario 1: Build a dataset with dedicated stems (no Demucs)
+
+```bash
+uv run process-dataset \
+  -i ~/clone_hero_library/ \
+  -o ./clone_hero.hf/ \
+  --extract-logmel \
+  --extract-mert \
+  --device cuda
+```
+
+**Time:** ~5s per song (with GPU)
+
+### Scenario 2: Separate stems first, then extract features
+
+```bash
+uv run process-dataset \
+  -i ~/clone_hero_library/ \
+  -o ./clone_hero.hf/ \
+  --separate-stems \
+  --stems-cache /tmp/separated_stems/ \
+  --extract-logmel \
+  --device cuda
+```
+
+**Time:** ~20s per song first run (Demucs), ~2s subsequent runs (cached stems)
+
+### Scenario 3: Fast tokenization only (no audio)
+
+```bash
+uv run process-dataset \
+  -i ~/songs/ \
+  -o ./tokens_only.hf/ \
+  --no-logmel \
+  --max-songs 100  # test with 100 songs
+```
+
+**Time:** ~1s per song
+
+### Scenario 4: Push to HuggingFace Hub
+
+```bash
+huggingface-cli login  # once
+
+uv run process-dataset \
+  -i ~/clone_hero_library/ \
+  --push-to-hub thejorseman/clone-hero-charts \
+  --extract-logmel \
+  --split train  # use "eval" or "test" for other splits
+```
+
+Then load anywhere:
 
 ```python
-max_duration_minutes = 120   # Maximum song duration
-max_beats            = 512   # Maximum beats per segment
-max_beatshifts       = 32    # Sub-beat timing granularity
+from datasets import load_dataset
+ds = load_dataset("thejorseman/clone-hero-charts", "train")
 ```
-
-The vocabulary and formulas are documented in [`tokenizer.txt`](tokenizer.txt).
 
 ---
 
-## Processing Pipeline
+## Transformer Architecture
+
+AutoCharterModel is a **conditioned encoder-decoder Transformer** (~10–12M parameters, designed for small datasets):
 
 ```
-Clone Hero song folders
-        │
-        ▼
-parse_all_songs.py          → chart_analysis_results.json
-        │
-        ▼
-tokenize_chart_dataset.py
-  ├── CloneHeroChartParser   → parse .chart file
-  ├── AudioProcessor         → load audio stems
-  ├── DemucsAudioSeparator   → separate audio (drums/bass/vocals/other)
-  ├── MERT                   → extract audio embeddings
-  └── CloneHeroTokenizer     → tokenize chart sequence
-        │
-        ▼
-Arrow shards (clone_hero_dataset_final/)
-        │
-        ▼
-merge_dataset.py             → merged dataset → HF Hub
+AudioEncoder                      TokenDecoder
+────────────                      ────────────
+MERT [B,N,768]    ──┐             Token Emb + Pos Enc
+LogMel [B,N,32,128] ──→ Sum ──→   + instrument/difficulty bias
+BPM [B,N]         ──┘   ↓         (added to every position)
+Time Sig [B,N]          Transformer Encoder    ↓
+Beat Duration [B,N]     (4 layers, d=256)  Causal Self-Attn (Flash Attn 2)
+                              ↓                  ↓
+                    audio_context [B,N,256] ──→ Cross-Attn
+                                              (beat distance bias)
+                                                  ↓
+                                           Logits [B,T,187]
 ```
 
-Processing is **resumable**: `checkpoints/checkpoint_metadata.json` tracks which files have been processed, the current index, total samples, and a version number.
+**Beat alignment:** Each token position maps to a beat via `beat_ids` (incremented at each `BEAT_BOUNDARY` token). A learnable ALiBi-like bias biases cross-attention toward the current beat.
+
+**Conditioning:** Instrument (guitar/bass/drums) and difficulty (0–6) are added as fixed offsets to every decoder position — simple and effective for small models.
+
+See **TOKENIZATION.md § 11** for full architecture details.
 
 ---
 
-## Key Scripts
+## Performance
 
-| Script | Purpose |
-|---|---|
-| `tokenize_chart_dataset.py` | Main pipeline — builds the Arrow dataset |
-| `parse_all_songs.py` | Scans source folders, outputs `chart_analysis_results.json` |
-| `merge_dataset.py` | Merges multiple dataset shards; uploads to HF Hub |
-| `migrate_pickle.py` | Converts legacy pickle files to Arrow format |
-| `data_anal.py` | Analyzes dataset statistics; generates HTML visualizations |
-| `duration_anal.py` | Plots note duration histogram |
-
----
-
-## Models & Utilities
-
-| File | Class | Description |
+| Task | Time/Song | Notes |
 |---|---|---|
-| `models/tokenizer.py` | `CloneHeroTokenizer` | Chart tokenizer |
-| `models/demucs.py` | `DemucsAudioSeparator` | Stem separation via Facebook Demucs |
-| `models/mert.py` | `MERT` | Audio embeddings via MERT-v1-95M |
-| `data/chart_loader.py` | `CloneHeroChartParser` | `.chart` file parser |
-| `data/audio_loaders.py` | `AudioProcessor` | Audio loading and resampling |
-| `data/midi_loader.py` | `MIDIProcessor` | MIDI file creation and loading |
-| `utils/time_utils.py` | — | Tick/BPM/second conversions |
-| `utils/audio_utils.py` | — | Audio data interpolation for NN input |
+| Parse + tokenize | 1–3s | CPU |
+| Log-mel extraction | 2–3s | CPU, depends on song length |
+| MERT extraction | 5–10s | GPU (cuda), 30–60s CPU |
+| Demucs separation | 15–30s | GPU (first run), cached after |
+| **Full pipeline (MERT+Demucs)** | **30–40s** | GPU recommended |
+| **Minimal (tokens only)** | **1–2s** | CPU sufficient |
+
+For 150 songs: ~5 hours full pipeline (GPU), ~5 minutes tokenization only (CPU).
 
 ---
 
-## Technologies
+## Roadmap
 
-- [Hugging Face Datasets](https://huggingface.co/docs/datasets) — Arrow dataset storage
-- [MERT-v1-95M](https://huggingface.co/m-a-p/MERT-v1-95M) — Music audio representations
-- [Demucs](https://github.com/facebookresearch/demucs) — Audio stem separation
-- [PyTorch](https://pytorch.org/) & [Transformers](https://huggingface.co/docs/transformers) — Deep learning
-- [LibROSA](https://librosa.org/) / [PyDub](https://github.com/jiaaro/pydub) / [SoundFile](https://python-soundfile.readthedocs.io/) — Audio processing
-- [Mido](https://mido.readthedocs.io/) — MIDI file handling
-- [Plotly](https://plotly.com/python/) — Data visualization
+- [x] Encoder-Decoder Transformer model with beat-aligned cross-attention
+- [x] Accelerate training (single GPU / 8× H100 / RTX 5070 Ti)
+- [x] Gradio demo with full pipeline (audio → .zip)
+- [ ] KV-cache for faster autoregressive generation
+- [ ] Curriculum learning (sort by BPM variance, chord density)
+- [ ] Support for other difficulty levels (Hard/Medium/Easy chart generation)
+- [ ] Benchmarks against professional charters
+
+---
+
+## Citation
+
+If you use this in research, cite:
+
+```bibtex
+@software{auto_charter_2025,
+  title={Auto-Charter: Clone Hero Song Tokenization & Dataset Pipeline},
+  author={[thejorseman]},
+  year={2025},
+  url={https://github.com/thejorseman/auto-charter}
+}
+```
+
+---
+
+## License
+
+MIT — see LICENSE file
+
+---
+
+## Contributing
+
+Pull requests welcome! Please:
+1. Run tests: `uv run pytest tests/`
+2. Format: `uv run ruff check --fix src/ tests/`
+3. Include test coverage for new features
+
+---
+
+## Contact
+
+Questions? Open an issue on GitHub or check the documentation above.
