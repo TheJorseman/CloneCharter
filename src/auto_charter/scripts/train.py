@@ -31,7 +31,8 @@ import click
 @click.option("--streaming", is_flag=True, help="Stream dataset without downloading (works with --hub-dataset or local parquet shards)")
 @click.option("--steps-per-epoch", default=1000, type=int, show_default=True, help="Training steps per epoch for cosine LR schedule (required when streaming)")
 @click.option("--val-samples", default=500, type=int, show_default=True, help="Validation samples to materialize from the stream")
-@click.option("--shuffle-buffer", default=200, type=int, show_default=True, help="Shuffle buffer size when streaming. Each row ~8MB (MERT+logmel), so 200=~1.6GB RAM")
+@click.option("--shuffle-buffer", default=200, type=int, show_default=True, help="Shuffle buffer size when streaming from Hub")
+@click.option("--window-size", default=5, type=int, show_default=True, help="Shards loaded per window in the data worker subprocess (local parquet only)")
 @click.option("--output-dir", "-o", required=True, type=click.Path(), help="Directory for checkpoints and logs")
 @click.option("--d-model", default=256, type=int, show_default=True, help="Model hidden dim")
 @click.option("--n-enc-layers", default=4, type=int, show_default=True, help="Number of encoder layers")
@@ -56,7 +57,7 @@ import click
 @click.option("--resume-from", default=None, type=click.Path(), help="Resume from checkpoint directory")
 @click.option("--max-samples", default=None, type=int, show_default=True, help="Limit dataset to N samples (for quick sanity-check runs)")
 def main(
-    dataset, hub_dataset, streaming, steps_per_epoch, val_samples, shuffle_buffer,
+    dataset, hub_dataset, streaming, steps_per_epoch, val_samples, shuffle_buffer, window_size,
     output_dir, d_model, n_enc_layers, n_dec_layers, n_heads, d_ff,
     dropout, batch_size, grad_accum, num_epochs, lr, warmup_steps, patience,
     test_size, max_tokens, max_beats, use_wandb, mixed_precision, num_workers,
@@ -84,12 +85,13 @@ def main(
         print(f"Loading dataset in streaming mode from: {source}")
         source_path = Path(source) if source else None
 
-        # Local parquet shards → ShardedParquetDataset (flat RAM, no HF caching)
+        # Local parquet shards → ShardedParquetDataset (subprocess worker, flat RAM)
         if source_path and source_path.exists() and list(source_path.glob("*.parquet")):
             train_ds, val_ds = ShardedParquetDataset.train_val_split(
                 source_path,
-                val_shards=max(1, val_samples // 20),  # ~20 rows/shard on average
+                val_shards=max(1, val_samples // 20),
                 seed=seed,
+                window_size=window_size,
                 **ds_kwargs,
             )
             print(f"Sharded streaming | Val: {len(val_ds)} rows (RAM: 1 shard at a time)")

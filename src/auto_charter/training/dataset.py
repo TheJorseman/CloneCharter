@@ -8,15 +8,20 @@ Filtering:
 Train/test split:
   - Stratified by instrument (guitar/bass/drums) to guarantee all three
     appear in both splits even with a small dataset.
+
+ShardedParquetDataset memory architecture:
+  Python's allocator never returns pages to the OS (fragmentation). The only
+  guaranteed fix is subprocess isolation: data loading runs in a worker process
+  that owns the parquet/pandas memory. When the worker finishes an epoch it is
+  joined and the OS reclaims ALL its memory. The main process (model + optimizer)
+  never touches raw shard data — it only receives rows through a Queue.
 """
 
 from __future__ import annotations
 
-import ctypes
 import gc
 import itertools
 import random
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,32 +29,103 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 
-def _release_ram() -> None:
-    """Force the OS to reclaim freed pages after a shard is done.
+# ── Subprocess helpers (must be module-level to be picklable on Windows) ──────
 
-    gc.collect() frees Python objects but the allocator keeps the pages
-    reserved in the process. This function goes further:
-      - PyArrow pool: release_unused() returns Arrow-managed pages
-      - Windows: SetProcessWorkingSetSize(-1,-1) trims the working set
-      - Linux:   malloc_trim(0) returns glibc heap pages to the kernel
+def _row_is_valid(row: dict, max_beats: int, min_tokens: int) -> bool:
+    if row.get("difficulty", -1) == -1:
+        return False
+    if not row.get("mert_embeddings") or not row.get("logmel_frames"):
+        return False
+    if row.get("num_beats", 0) > max_beats:
+        return False
+    if len(row.get("tokens", [])) < min_tokens:
+        return False
+    return True
+
+
+def _worker_main(
+    shard_paths: list[str],
+    out_queue,
+    window_size: int,
+    max_beats: int,
+    min_tokens: int,
+    shuffle: bool,
+    seed: int,
+) -> None:
+    """Subprocess entry point.
+
+    Loads shards in windows of `window_size`. After each window the worker
+    explicitly frees all Python and C-heap memory before loading the next one.
+    Rows are sent one by one through `out_queue`. A None sentinel signals EOF.
+
+    Running in a subprocess means the OS reclaims ALL memory here when the
+    process exits — regardless of Python heap fragmentation.
     """
-    gc.collect()
-    try:
-        import pyarrow as pa
-        pa.default_memory_pool().release_unused()
-    except Exception:
-        pass
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
-        except Exception:
-            pass
-    elif sys.platform.startswith("linux"):
-        try:
-            ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+    import gc
+    import ctypes
+    import sys
+    import random as _random
+    import pandas as pd
 
+    def _release():
+        gc.collect()
+        try:
+            import pyarrow as pa
+            pa.default_memory_pool().release_unused()
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            try:
+                handle = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.kernel32.SetProcessWorkingSetSize(
+                    handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1)
+                )
+            except Exception:
+                pass
+        elif sys.platform.startswith("linux"):
+            try:
+                ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+
+    rng = _random.Random(seed)
+    paths = list(shard_paths)
+    if shuffle:
+        rng.shuffle(paths)
+
+    for window_start in range(0, len(paths), window_size):
+        window = paths[window_start : window_start + window_size]
+
+        # ── Load this window into a single row list ────────────────────────
+        rows: list[dict] = []
+        for path in window:
+            try:
+                df = pd.read_parquet(path)
+            except Exception as exc:
+                print(f"[worker] skip {path}: {exc}")
+                continue
+            col_names = list(df.columns)
+            for i in range(len(df)):
+                row = {col: df[col].iat[i] for col in col_names}
+                if _row_is_valid(row, max_beats, min_tokens):
+                    rows.append(row)
+            del df
+            gc.collect()
+
+        if shuffle:
+            rng.shuffle(rows)
+
+        for row in rows:
+            out_queue.put(row)
+
+        # ── Free this window completely before loading the next ────────────
+        del rows
+        _release()
+
+    out_queue.put(None)  # sentinel: epoch done
+
+
+# ── Public dataset classes ─────────────────────────────────────────────────────
 
 class AutoCharterDataset(Dataset):
     """PyTorch Dataset wrapping a HuggingFace datasets.Dataset.
@@ -75,7 +151,6 @@ class AutoCharterDataset(Dataset):
         self.max_beats = max_beats
         self.min_tokens = min_tokens
 
-        # Apply filters
         filtered = hf_dataset.filter(
             lambda row: self._keep(row, max_beats, min_tokens),
             desc="Filtering dataset",
@@ -87,19 +162,15 @@ class AutoCharterDataset(Dataset):
 
     @staticmethod
     def _keep(row: dict, max_beats: int, min_tokens: int) -> bool:
-        # Drop uncharted
         if row.get("difficulty", -1) == -1:
             return False
-        # Drop rows where audio features were not extracted
         mert = row.get("mert_embeddings", [])
         logmel = row.get("logmel_frames", [])
         if len(mert) == 0 or len(logmel) == 0:
             return False
-        # Drop excessive beats (OOM guard)
         num_beats = row.get("num_beats", 0)
         if num_beats > max_beats:
             return False
-        # Drop too-short sequences
         tokens = row.get("tokens", [])
         if len(tokens) < min_tokens:
             return False
@@ -118,7 +189,6 @@ class AutoCharterDataset(Dataset):
         split: str | None = None,
         **kwargs,
     ) -> "AutoCharterDataset":
-        """Load from a local Arrow/Parquet dataset directory."""
         import datasets as hf_datasets
 
         ds = hf_datasets.load_from_disk(str(dataset_path))
@@ -136,7 +206,6 @@ class AutoCharterDataset(Dataset):
         max_beats: int = 1024,
         min_tokens: int = 10,
     ) -> "StreamingAutoCharterDataset":
-        """Wrap a HuggingFace IterableDataset for streaming training."""
         return StreamingAutoCharterDataset(
             iterable_dataset,
             max_tokens=max_tokens,
@@ -151,12 +220,6 @@ class AutoCharterDataset(Dataset):
         seed: int = 42,
         **dataset_kwargs,
     ) -> tuple["AutoCharterDataset", "AutoCharterDataset"]:
-        """Stratified split by instrument.
-
-        Groups rows by instrument, splits each group independently (80/20),
-        then concatenates. This ensures all three instruments appear in both
-        splits even with a very small dataset.
-        """
         import datasets as hf_datasets
 
         instruments = ["guitar", "bass", "drums"]
@@ -167,7 +230,6 @@ class AutoCharterDataset(Dataset):
             if len(group) == 0:
                 continue
             if len(group) == 1:
-                # Can't split — put in train only
                 train_parts.append(group)
                 continue
             split = group.train_test_split(test_size=test_size, seed=seed)
@@ -181,7 +243,7 @@ class AutoCharterDataset(Dataset):
         test_ds = (
             hf_datasets.concatenate_datasets(test_parts).shuffle(seed=seed)
             if test_parts
-            else train_parts[0].select([])  # empty dataset if only 1 sample total
+            else train_parts[0].select([])
         )
 
         return (
@@ -191,17 +253,7 @@ class AutoCharterDataset(Dataset):
 
 
 class StreamingAutoCharterDataset(IterableDataset):
-    """Streaming PyTorch IterableDataset wrapping a HuggingFace IterableDataset.
-
-    Filters are applied lazily — no data is loaded into memory upfront.
-    Shuffle via HuggingFace's buffer-based shuffle before wrapping.
-
-    Args:
-        iterable_dataset: A datasets.IterableDataset (with streaming=True).
-        max_tokens: Truncate token sequences longer than this.
-        max_beats: Drop rows with more beats than this.
-        min_tokens: Drop rows with fewer tokens than this.
-    """
+    """Streaming PyTorch IterableDataset wrapping a HuggingFace IterableDataset."""
 
     def __init__(
         self,
@@ -231,11 +283,6 @@ class StreamingAutoCharterDataset(IterableDataset):
         max_beats: int = 1024,
         min_tokens: int = 10,
     ) -> "AutoCharterDataset":
-        """Take `n_samples` from a streaming split and return a regular Dataset.
-
-        Materializing validation avoids re-streaming every eval loop and
-        ensures reproducible validation metrics across epochs.
-        """
         import datasets as hf_datasets
 
         filtered = iterable_dataset.filter(
@@ -244,8 +291,7 @@ class StreamingAutoCharterDataset(IterableDataset):
         samples = list(itertools.islice(filtered, n_samples))
         if not samples:
             raise ValueError(
-                "No valid samples found in the validation stream after filtering. "
-                "Check that mert/logmel embeddings are present."
+                "No valid samples found in the validation stream after filtering."
             )
         hf_ds = hf_datasets.Dataset.from_list(samples)
         print(f"StreamingAutoCharterDataset: materialized {len(hf_ds)} val samples")
@@ -253,14 +299,24 @@ class StreamingAutoCharterDataset(IterableDataset):
 
 
 class ShardedParquetDataset(IterableDataset):
-    """Streams local parquet shards one file at a time with explicit memory release.
+    """Streams local parquet shards through a subprocess worker.
 
-    Unlike HuggingFace streaming (which caches Arrow buffers internally and leaks
-    RAM linearly), this class loads one shard, yields its rows, deletes the table,
-    and calls gc.collect() before moving to the next shard. RAM stays flat.
+    Architecture
+    ------------
+    A single worker subprocess owns all parquet/pandas memory. It loads shards
+    in windows of `window_size` files, frees each window after sending its rows,
+    then loads the next window. Rows travel from worker → main process via a
+    bounded multiprocessing Queue.
 
-    Shuffle is shard-level (shard order is randomized each epoch) plus optional
-    row-level shuffle within each shard — no global shuffle buffer needed.
+    When the epoch ends the worker is joined and the OS reclaims ALL its memory
+    at the kernel level — bypassing Python's allocator entirely. The main process
+    (model + optimizer) never accumulates shard data, so its RAM stays flat.
+
+    Parameters
+    ----------
+    shard_paths   : list of parquet file paths
+    window_size   : shards loaded at once in the worker (default 5)
+    queue_maxsize : max rows buffered in the Queue (backpressure, default 200)
     """
 
     def __init__(
@@ -271,42 +327,51 @@ class ShardedParquetDataset(IterableDataset):
         min_tokens: int = 10,
         shuffle: bool = True,
         seed: int = 42,
+        window_size: int = 5,
+        queue_maxsize: int = 200,
     ) -> None:
         super().__init__()
-        self.shard_paths = list(shard_paths)
+        self.shard_paths = [str(p) for p in shard_paths]
         self.max_tokens = max_tokens
         self.max_beats = max_beats
         self.min_tokens = min_tokens
         self.shuffle = shuffle
         self.seed = seed
+        self.window_size = window_size
+        self.queue_maxsize = queue_maxsize
 
     def __iter__(self):
-        # pandas is used instead of pyarrow.read_table + as_py() because as_py()
-        # on large list columns creates millions of Python float objects (24 bytes
-        # each), fragmenting the heap permanently. pandas stores those same arrays
-        # as numpy (C-heap, contiguous) which malloc_trim/SetProcessWorkingSetSize
-        # can actually release back to the OS.
-        import pandas as pd
+        import multiprocessing
 
-        shards = list(self.shard_paths)
-        rng = random.Random(self.seed)
-        if self.shuffle:
-            rng.shuffle(shards)
+        ctx = multiprocessing.get_context("spawn")
+        queue = ctx.Queue(maxsize=self.queue_maxsize)
 
-        for shard_path in shards:
-            df = pd.read_parquet(str(shard_path))
-            col_names = list(df.columns)
-            indices = list(range(len(df)))
-            if self.shuffle:
-                rng.shuffle(indices)
+        worker = ctx.Process(
+            target=_worker_main,
+            args=(
+                self.shard_paths,
+                queue,
+                self.window_size,
+                self.max_beats,
+                self.min_tokens,
+                self.shuffle,
+                self.seed,
+            ),
+            daemon=True,
+        )
+        worker.start()
 
-            for i in indices:
-                row = {col: df[col].iat[i] for col in col_names}
-                if AutoCharterDataset._keep(row, self.max_beats, self.min_tokens):
-                    yield row
-
-            del df, indices
-            _release_ram()
+        try:
+            while True:
+                row = queue.get(timeout=600)  # 10 min timeout per row
+                if row is None:
+                    break
+                yield row
+        except Exception:
+            pass
+        finally:
+            worker.terminate()
+            worker.join()
 
     @classmethod
     def from_directory(
@@ -331,12 +396,9 @@ class ShardedParquetDataset(IterableDataset):
         max_tokens: int = 16384,
         max_beats: int = 1024,
         min_tokens: int = 10,
+        window_size: int = 5,
     ) -> tuple["ShardedParquetDataset", "AutoCharterDataset"]:
-        """Split shard list into train/val without loading all data into RAM.
-
-        Val shards are fully materialized (small fixed set). Train shards stream
-        one file at a time — RAM stays flat throughout training.
-        """
+        """Reserve val_shards for validation (materialized), rest for streaming train."""
         import pandas as pd
         import datasets as hf_datasets
 
@@ -350,31 +412,32 @@ class ShardedParquetDataset(IterableDataset):
         val_paths = shuffled[:val_shards]
         train_paths = shuffled[val_shards:]
 
-        print(f"ShardedParquetDataset: {len(train_paths)} train shards, {len(val_paths)} val shards")
+        print(f"ShardedParquetDataset: {len(train_paths)} train shards | {len(val_paths)} val shards")
 
         ds_kwargs = dict(max_tokens=max_tokens, max_beats=max_beats, min_tokens=min_tokens)
 
-        # Materialize val rows — pandas avoids Python float object fragmentation
-        val_rows = []
+        # Materialize val — small enough to hold in RAM permanently
+        val_rows: list[dict] = []
         for p in val_paths:
             df = pd.read_parquet(str(p))
-            col_names = list(df.columns)
             for i in range(len(df)):
-                row = {col: df[col].iat[i] for col in col_names}
-                if AutoCharterDataset._keep(row, max_beats, min_tokens):
+                row = {col: df[col].iat[i] for col in df.columns}
+                if _row_is_valid(row, max_beats, min_tokens):
                     val_rows.append(row)
             del df
-            _release_ram()
+            gc.collect()
 
         if not val_rows:
-            raise ValueError("No valid rows found in val shards after filtering.")
+            raise ValueError("No valid rows in val shards after filtering.")
 
         val_hf = hf_datasets.Dataset.from_list(val_rows)
         del val_rows
-        _release_ram()
-
+        gc.collect()
         print(f"  → Val materialized: {len(val_hf)} rows")
 
-        train_ds = cls(train_paths, shuffle=True, seed=seed, **ds_kwargs)
+        train_ds = cls(
+            train_paths, shuffle=True, seed=seed,
+            window_size=window_size, **ds_kwargs,
+        )
         val_ds = AutoCharterDataset(val_hf, **ds_kwargs)
         return train_ds, val_ds
