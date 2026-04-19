@@ -281,7 +281,12 @@ class ShardedParquetDataset(IterableDataset):
         self.seed = seed
 
     def __iter__(self):
-        import pyarrow.parquet as pq
+        # pandas is used instead of pyarrow.read_table + as_py() because as_py()
+        # on large list columns creates millions of Python float objects (24 bytes
+        # each), fragmenting the heap permanently. pandas stores those same arrays
+        # as numpy (C-heap, contiguous) which malloc_trim/SetProcessWorkingSetSize
+        # can actually release back to the OS.
+        import pandas as pd
 
         shards = list(self.shard_paths)
         rng = random.Random(self.seed)
@@ -289,23 +294,18 @@ class ShardedParquetDataset(IterableDataset):
             rng.shuffle(shards)
 
         for shard_path in shards:
-            table = pq.read_table(shard_path)
-            col_names = table.schema.names
-            rows = [
-                {col: table.column(col)[i].as_py() for col in col_names}
-                for i in range(table.num_rows)
-            ]
-            del table
-            _release_ram()
-
+            df = pd.read_parquet(str(shard_path))
+            col_names = list(df.columns)
+            indices = list(range(len(df)))
             if self.shuffle:
-                rng.shuffle(rows)
+                rng.shuffle(indices)
 
-            for row in rows:
+            for i in indices:
+                row = {col: df[col].iat[i] for col in col_names}
                 if AutoCharterDataset._keep(row, self.max_beats, self.min_tokens):
                     yield row
 
-            del rows
+            del df, indices
             _release_ram()
 
     @classmethod
@@ -337,7 +337,7 @@ class ShardedParquetDataset(IterableDataset):
         Val shards are fully materialized (small fixed set). Train shards stream
         one file at a time — RAM stays flat throughout training.
         """
-        import pyarrow.parquet as pq
+        import pandas as pd
         import datasets as hf_datasets
 
         paths = sorted(Path(directory).glob(pattern))
@@ -354,16 +354,16 @@ class ShardedParquetDataset(IterableDataset):
 
         ds_kwargs = dict(max_tokens=max_tokens, max_beats=max_beats, min_tokens=min_tokens)
 
-        # Materialize val rows from the reserved shards
+        # Materialize val rows — pandas avoids Python float object fragmentation
         val_rows = []
         for p in val_paths:
-            table = pq.read_table(p)
-            col_names = table.schema.names
-            for i in range(table.num_rows):
-                row = {col: table.column(col)[i].as_py() for col in col_names}
+            df = pd.read_parquet(str(p))
+            col_names = list(df.columns)
+            for i in range(len(df)):
+                row = {col: df[col].iat[i] for col in col_names}
                 if AutoCharterDataset._keep(row, max_beats, min_tokens):
                     val_rows.append(row)
-            del table
+            del df
             _release_ram()
 
         if not val_rows:
