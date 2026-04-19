@@ -12,14 +12,37 @@ Train/test split:
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import itertools
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
+
+
+def _release_ram() -> None:
+    """Force the OS to reclaim freed pages.
+
+    gc.collect() frees Python objects but Python's allocator keeps the pages
+    reserved. On Windows this calls SetProcessWorkingSetSize(-1,-1) which trims
+    the working set and returns physical pages to the OS. PyArrow has its own
+    allocator pool — release_unused() returns those pages too.
+    """
+    gc.collect()
+    try:
+        import pyarrow as pa
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
+        except Exception:
+            pass
 
 
 class AutoCharterDataset(Dataset):
@@ -267,7 +290,7 @@ class ShardedParquetDataset(IterableDataset):
                 for i in range(table.num_rows)
             ]
             del table
-            gc.collect()
+            _release_ram()
 
             if self.shuffle:
                 rng.shuffle(rows)
@@ -277,7 +300,7 @@ class ShardedParquetDataset(IterableDataset):
                     yield row
 
             del rows
-            gc.collect()
+            _release_ram()
 
     @classmethod
     def from_directory(
@@ -335,14 +358,14 @@ class ShardedParquetDataset(IterableDataset):
                 if AutoCharterDataset._keep(row, max_beats, min_tokens):
                     val_rows.append(row)
             del table
-            gc.collect()
+            _release_ram()
 
         if not val_rows:
             raise ValueError("No valid rows found in val shards after filtering.")
 
         val_hf = hf_datasets.Dataset.from_list(val_rows)
         del val_rows
-        gc.collect()
+        _release_ram()
 
         print(f"  → Val materialized: {len(val_hf)} rows")
 
