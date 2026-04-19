@@ -32,7 +32,8 @@ import click
 @click.option("--steps-per-epoch", default=1000, type=int, show_default=True, help="Training steps per epoch for cosine LR schedule (required when streaming)")
 @click.option("--val-samples", default=500, type=int, show_default=True, help="Validation samples to materialize from the stream")
 @click.option("--shuffle-buffer", default=200, type=int, show_default=True, help="Shuffle buffer size when streaming from Hub")
-@click.option("--window-size", default=5, type=int, show_default=True, help="Shards loaded per window in the data worker subprocess (local parquet only)")
+@click.option("--window-size", default=5, type=int, show_default=True, help="(Legacy) Ignored — use --max-shards-in-memory instead")
+@click.option("--max-shards-in-memory", default=2, type=int, show_default=True, help="Max parquet shards in RAM at once (controls peak memory for local parquet training)")
 @click.option("--output-dir", "-o", required=True, type=click.Path(), help="Directory for checkpoints and logs")
 @click.option("--d-model", default=256, type=int, show_default=True, help="Model hidden dim")
 @click.option("--n-enc-layers", default=4, type=int, show_default=True, help="Number of encoder layers")
@@ -57,7 +58,8 @@ import click
 @click.option("--resume-from", default=None, type=click.Path(), help="Resume from checkpoint directory")
 @click.option("--max-samples", default=None, type=int, show_default=True, help="Limit dataset to N samples (for quick sanity-check runs)")
 def main(
-    dataset, hub_dataset, streaming, steps_per_epoch, val_samples, shuffle_buffer, window_size,
+    dataset, hub_dataset, streaming, steps_per_epoch, val_samples, shuffle_buffer,
+    window_size, max_shards_in_memory,
     output_dir, d_model, n_enc_layers, n_dec_layers, n_heads, d_ff,
     dropout, batch_size, grad_accum, num_epochs, lr, warmup_steps, patience,
     test_size, max_tokens, max_beats, use_wandb, mixed_precision, num_workers,
@@ -69,7 +71,7 @@ def main(
 
     from auto_charter.model.charter_model import AutoCharterModel
     from auto_charter.model.config import AutoCharterConfig
-    from auto_charter.training.dataset import AutoCharterDataset, StreamingAutoCharterDataset, ShardedParquetDataset
+    from auto_charter.training.dataset import AutoCharterDataset, StreamingAutoCharterDataset, ShardIndexedDataset
     from auto_charter.training.trainer import AutoCharterTrainer
 
     if dataset is None and hub_dataset is None:
@@ -85,16 +87,16 @@ def main(
         print(f"Loading dataset in streaming mode from: {source}")
         source_path = Path(source) if source else None
 
-        # Local parquet shards → ShardedParquetDataset (subprocess worker, flat RAM)
+        # Local parquet shards → ShardIndexedDataset (LRU shard cache, bounded RAM)
         if source_path and source_path.exists() and list(source_path.glob("*.parquet")):
-            train_ds, val_ds = ShardedParquetDataset.train_val_split(
+            train_ds, val_ds = ShardIndexedDataset.train_val_split(
                 source_path,
                 val_shards=max(1, val_samples // 20),
                 seed=seed,
-                window_size=window_size,
+                max_shards_in_memory=max_shards_in_memory,
                 **ds_kwargs,
             )
-            print(f"Sharded streaming | Val: {len(val_ds)} rows (RAM: 1 shard at a time)")
+            print(f"ShardIndexed | {len(train_ds)} train rows | {len(val_ds)} val rows | max {max_shards_in_memory} shards in RAM")
 
         # HuggingFace Hub → HF streaming with shuffle buffer
         else:
@@ -210,6 +212,7 @@ def main(
         mixed_precision=mixed_precision,
         resume_from=Path(resume_from) if resume_from else None,
         steps_per_epoch=steps_per_epoch if streaming else 0,
+        seed=seed,
     )
     trainer.train()
 

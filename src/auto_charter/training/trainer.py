@@ -29,7 +29,7 @@ from auto_charter.model.charter_model import AutoCharterModel
 from auto_charter.model.config import AutoCharterConfig
 from auto_charter.training import metrics as M
 from auto_charter.training.collator import AutoCharterTrainCollator
-from auto_charter.training.dataset import AutoCharterDataset
+from auto_charter.training.dataset import AutoCharterDataset, ShardGroupedSampler, ShardIndexedDataset
 
 
 @dataclass
@@ -73,6 +73,7 @@ class AutoCharterTrainer:
         mixed_precision: str = "bf16",  # "bf16", "fp16", or "no"
         resume_from: Optional[Path] = None,
         steps_per_epoch: int = 0,      # required when train_dataset is IterableDataset
+        seed: int = 42,
     ) -> None:
         from accelerate import Accelerator
         from accelerate.utils import ProjectConfiguration
@@ -101,15 +102,33 @@ class AutoCharterTrainer:
             max_beats=self.config.max_beats,
         )
 
+        self._raw_train_dataset = train_dataset  # keep ref for evict_all / set_epoch
+
         _train_is_streaming = isinstance(train_dataset, IterableDataset)
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=not _train_is_streaming,
-            collate_fn=collator,
-            num_workers=num_workers,
-            pin_memory=False,
-        )
+        _is_shard_indexed = isinstance(train_dataset, ShardIndexedDataset)
+
+        if _is_shard_indexed:
+            self._shard_sampler = ShardGroupedSampler(
+                train_dataset, shuffle=True, seed=seed if seed is not None else 42
+            )
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                sampler=self._shard_sampler,
+                collate_fn=collator,
+                num_workers=0,       # must be 0: shard cache is not fork-safe
+                pin_memory=False,
+            )
+        else:
+            self._shard_sampler = None
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=not _train_is_streaming,
+                collate_fn=collator,
+                num_workers=num_workers,
+                pin_memory=False,
+            )
         self.val_loader = DataLoader(
             val_dataset,
             batch_size=max(1, batch_size // 2),
@@ -189,7 +208,14 @@ class AutoCharterTrainer:
                 print("Train batches: (streaming — unknown), Val batches: (streaming — unknown)")
 
         for epoch in range(self.num_epochs):
+            if self._shard_sampler is not None:
+                self._shard_sampler.set_epoch(epoch)
+
             epoch_loss = self._train_epoch(epoch)
+
+            # Release shard cache between epochs so next epoch starts fresh
+            if isinstance(self._raw_train_dataset, ShardIndexedDataset):
+                self._raw_train_dataset.evict_all()
 
             # Validate every epoch (or at specified step interval)
             val_metrics = self._validate()

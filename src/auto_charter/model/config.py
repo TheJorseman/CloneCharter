@@ -27,7 +27,7 @@ class AutoCharterConfig:
     max_beats: int = 1024
 
     # ── Audio input dims ──────────────────────────────────────────────────────
-    mert_dim: int = 768
+    mert_dim: int = 1024
     logmel_frames: int = 32   # TARGET_FRAMES in LogMelExtractor
     logmel_mels: int = 128    # N_MELS
 

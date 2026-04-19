@@ -45,6 +45,8 @@ convert-dataset  = "auto_charter.scripts.convert_dataset:main"
 train-charter    = "auto_charter.scripts.train:main"
 validate-charter = "auto_charter.scripts.validate:main"
 demo-charter     = "auto_charter.scripts.gradio_demo:main"
+push-dataset     = "auto_charter.scripts.push_dataset:main"
+debug-ram        = "auto_charter.scripts.debug_ram:main"
 
 [build-system]
 requires = ["hatchling"]

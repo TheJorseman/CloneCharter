@@ -22,6 +22,35 @@ from auto_charter.vocab.tokens import Vocab
 _INSTR_TO_ID = {"guitar": 0, "bass": 1, "drums": 2}
 
 
+def _to_float32_array(v: Any, fallback_shape: tuple) -> np.ndarray:
+    """Convert any audio array to a contiguous float32 ndarray.
+
+    Handles the three formats pandas produces when reading nested parquet columns:
+      - Already a float32 ndarray → return as-is (or cast)
+      - object-dtype array of float arrays (singly nested, e.g. mert [N, 768])
+        → np.stack(v)
+      - object-dtype array of object-dtype arrays (doubly nested, e.g. logmel
+        [N, 32, 128]) → stack each beat, then stack all beats
+      - Python list of lists → np.array
+    """
+    if isinstance(v, np.ndarray):
+        if v.dtype != object:
+            return v if v.dtype == np.float32 else v.astype(np.float32)
+        if len(v) == 0:
+            return np.zeros(fallback_shape, np.float32)
+        sample = v.flat[0]
+        if isinstance(sample, np.ndarray) and sample.dtype == object:
+            # Doubly nested (e.g. logmel: num_beats × (32,) object each holding (128,) arrays)
+            return np.array(
+                [np.stack(sub).astype(np.float32) for sub in v], dtype=np.float32
+            )
+        # Singly nested (e.g. mert: num_beats × (768,) float32 arrays)
+        return np.stack(v).astype(np.float32)
+    if v is not None and len(v) > 0:
+        return np.array(v, dtype=np.float32)
+    return np.zeros(fallback_shape, dtype=np.float32)
+
+
 class AutoCharterTrainCollator:
     """Collate a batch of dataset rows into padded tensors for AutoCharterModel.
 
@@ -67,27 +96,33 @@ class AutoCharterTrainCollator:
         mert_list = []
         for row in batch:
             m = row["mert_embeddings"]
-            arr = np.array(m, dtype=np.float32) if len(m) > 0 else np.zeros((0, 768), dtype=np.float32)
+            arr = _to_float32_array(m, fallback_shape=(0,))
             mert_list.append(arr[: self.max_beats])
 
         logmel_list = []
         for row in batch:
             lm = row["logmel_frames"]
-            arr = np.array(lm, dtype=np.float32) if len(lm) > 0 else np.zeros((0, 32, 128), dtype=np.float32)
+            arr = _to_float32_array(lm, fallback_shape=(0,))
             logmel_list.append(arr[: self.max_beats])
 
         max_beats_batch = max(m.shape[0] for m in mert_list) if mert_list else 0
         max_beats_batch = max(max_beats_batch, 1)  # avoid zero-size
 
-        mert_array = np.zeros((B, max_beats_batch, 768), dtype=np.float32)
-        logmel_array = np.zeros((B, max_beats_batch, 32, 128), dtype=np.float32)
+        # Use max dim across the batch — handles datasets with mixed MERT model versions
+        mert_dim = max((m.shape[1] for m in mert_list if m.ndim >= 2 and m.shape[0] > 0), default=1024)
+        logmel_shape = next((lm.shape[1:] for lm in logmel_list if lm.ndim >= 3 and lm.shape[0] > 0), (32, 128))
+
+        mert_array = np.zeros((B, max_beats_batch, mert_dim), dtype=np.float32)
+        logmel_array = np.zeros((B, max_beats_batch, *logmel_shape), dtype=np.float32)
         beat_mask = np.zeros((B, max_beats_batch), dtype=np.bool_)
 
         for i, (m, lm) in enumerate(zip(mert_list, logmel_list)):
             nb = m.shape[0]
             if nb > 0:
-                mert_array[i, :nb] = m
-                logmel_array[i, :nb] = lm
+                d = m.shape[1]  # actual mert dim for this row (may be < mert_dim)
+                mert_array[i, :nb, :d] = m
+                lm_shape = lm.shape[1:]
+                logmel_array[i, :nb, :lm_shape[0], :lm_shape[1]] = lm
                 beat_mask[i, :nb] = True
 
         # ── Beat timing tensors ────────────────────────────────────────────────
