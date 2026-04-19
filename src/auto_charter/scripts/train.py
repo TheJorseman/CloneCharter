@@ -31,6 +31,7 @@ import click
 @click.option("--streaming", is_flag=True, help="Stream dataset without downloading (works with --hub-dataset or local parquet shards)")
 @click.option("--steps-per-epoch", default=1000, type=int, show_default=True, help="Training steps per epoch for cosine LR schedule (required when streaming)")
 @click.option("--val-samples", default=500, type=int, show_default=True, help="Validation samples to materialize from the stream")
+@click.option("--shuffle-buffer", default=200, type=int, show_default=True, help="Shuffle buffer size when streaming. Each row ~8MB (MERT+logmel), so 200=~1.6GB RAM")
 @click.option("--output-dir", "-o", required=True, type=click.Path(), help="Directory for checkpoints and logs")
 @click.option("--d-model", default=256, type=int, show_default=True, help="Model hidden dim")
 @click.option("--n-enc-layers", default=4, type=int, show_default=True, help="Number of encoder layers")
@@ -55,7 +56,7 @@ import click
 @click.option("--resume-from", default=None, type=click.Path(), help="Resume from checkpoint directory")
 @click.option("--max-samples", default=None, type=int, show_default=True, help="Limit dataset to N samples (for quick sanity-check runs)")
 def main(
-    dataset, hub_dataset, streaming, steps_per_epoch, val_samples,
+    dataset, hub_dataset, streaming, steps_per_epoch, val_samples, shuffle_buffer,
     output_dir, d_model, n_enc_layers, n_dec_layers, n_heads, d_ff,
     dropout, batch_size, grad_accum, num_epochs, lr, warmup_steps, patience,
     test_size, max_tokens, max_beats, use_wandb, mixed_precision, num_workers,
@@ -81,21 +82,34 @@ def main(
     if streaming:
         source = hub_dataset or dataset
         print(f"Loading dataset in streaming mode from: {source}")
-        raw_ds = hf_datasets.load_dataset(source, streaming=True)
+        source_path = Path(source) if source else None
+        if source_path and source_path.exists():
+            parquet_files = sorted(source_path.glob("*.parquet"))
+            if parquet_files:
+                raw_ds = hf_datasets.load_dataset(
+                    "parquet",
+                    data_files={"train": str(source_path / "*.parquet")},
+                    streaming=True,
+                )
+            else:
+                raw_ds = hf_datasets.load_dataset(source, streaming=True)
+        else:
+            raw_ds = hf_datasets.load_dataset(source, streaming=True)
 
         if isinstance(raw_ds, hf_datasets.IterableDatasetDict):
             if "train" in raw_ds and ("test" in raw_ds or "validation" in raw_ds):
-                train_split = raw_ds["train"].shuffle(seed=seed, buffer_size=10_000)
+                train_split = raw_ds["train"].shuffle(seed=seed, buffer_size=shuffle_buffer)
                 val_split_key = "test" if "test" in raw_ds else "validation"
                 val_split = raw_ds[val_split_key]
             else:
-                # Single split — use it for training; materialize val from the same stream
                 only_split = next(iter(raw_ds.values()))
-                train_split = only_split.shuffle(seed=seed, buffer_size=10_000)
+                train_split = only_split.shuffle(seed=seed, buffer_size=shuffle_buffer)
                 val_split = only_split
         else:
-            train_split = raw_ds.shuffle(seed=seed, buffer_size=10_000)
+            train_split = raw_ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
             val_split = raw_ds
+
+        print(f"  → Shuffle buffer: {shuffle_buffer} rows (~{shuffle_buffer * 8 / 1024:.1f} GB RAM estimated)")
 
         train_ds = StreamingAutoCharterDataset(train_split, **ds_kwargs)
         val_ds = StreamingAutoCharterDataset.materialize_val(val_split, n_samples=val_samples, **ds_kwargs)
@@ -108,15 +122,24 @@ def main(
         print(f"Loading dataset from {dataset} ...")
         dataset_path = Path(dataset)
 
-        try:
-            raw_ds = hf_datasets.load_from_disk(str(dataset_path))
-        except FileNotFoundError:
-            train_subdir = dataset_path / "train"
-            if train_subdir.exists():
-                print(f"  → Not a DatasetDict root; loading split from {train_subdir}")
-                raw_ds = hf_datasets.load_from_disk(str(train_subdir))
-            else:
-                raise
+        parquet_files = sorted(dataset_path.glob("*.parquet"))
+        if parquet_files:
+            print(f"  → Found {len(parquet_files)} parquet shards, loading with load_dataset()")
+            raw_ds = hf_datasets.load_dataset(
+                "parquet",
+                data_files=str(dataset_path / "*.parquet"),
+                split="train",
+            )
+        else:
+            try:
+                raw_ds = hf_datasets.load_from_disk(str(dataset_path))
+            except FileNotFoundError:
+                train_subdir = dataset_path / "train"
+                if train_subdir.exists():
+                    print(f"  → Not a DatasetDict root; loading split from {train_subdir}")
+                    raw_ds = hf_datasets.load_from_disk(str(train_subdir))
+                else:
+                    raise
 
         if max_samples is not None:
             if isinstance(raw_ds, hf_datasets.DatasetDict):
