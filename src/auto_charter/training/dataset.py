@@ -25,12 +25,13 @@ from torch.utils.data import Dataset, IterableDataset
 
 
 def _release_ram() -> None:
-    """Force the OS to reclaim freed pages.
+    """Force the OS to reclaim freed pages after a shard is done.
 
-    gc.collect() frees Python objects but Python's allocator keeps the pages
-    reserved. On Windows this calls SetProcessWorkingSetSize(-1,-1) which trims
-    the working set and returns physical pages to the OS. PyArrow has its own
-    allocator pool — release_unused() returns those pages too.
+    gc.collect() frees Python objects but the allocator keeps the pages
+    reserved in the process. This function goes further:
+      - PyArrow pool: release_unused() returns Arrow-managed pages
+      - Windows: SetProcessWorkingSetSize(-1,-1) trims the working set
+      - Linux:   malloc_trim(0) returns glibc heap pages to the kernel
     """
     gc.collect()
     try:
@@ -41,6 +42,11 @@ def _release_ram() -> None:
     if sys.platform == "win32":
         try:
             ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
+        except Exception:
+            pass
+    elif sys.platform.startswith("linux"):
+        try:
+            ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
         except Exception:
             pass
 
