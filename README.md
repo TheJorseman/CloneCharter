@@ -41,9 +41,17 @@ uv run process-dataset \
   --device cuda
 ```
 
-Or Download 
+Or stream directly from HuggingFace Hub (no download needed):
 
-https://huggingface.co/datasets/thejorseman/CloneHeroCharts
+```bash
+accelerate launch src/auto_charter/scripts/train.py \
+  --hub-dataset thejorseman/CloneHeroDatasetCharts \
+  --streaming \
+  --steps-per-epoch 2000 \
+  --output-dir ./checkpoints/run1
+```
+
+Dataset: https://huggingface.co/datasets/thejorseman/CloneHeroDatasetCharts
 
 
 ### 2. Train the model
@@ -52,11 +60,19 @@ https://huggingface.co/datasets/thejorseman/CloneHeroCharts
 # Configure accelerate once (choose bf16 for H100, fp16 for RTX)
 accelerate config
 
-# Train (single GPU)
+# Train from local dataset (single GPU)
 accelerate launch src/auto_charter/scripts/train.py \
   --dataset ./my_dataset/ \
   --output-dir ./checkpoints/run1 \
   --batch-size 4 --grad-accum 4 --num-epochs 100
+
+# Train streaming from HuggingFace Hub (no download — ideal for large datasets)
+accelerate launch src/auto_charter/scripts/train.py \
+  --hub-dataset thejorseman/CloneHeroDatasetCharts \
+  --streaming \
+  --steps-per-epoch 2000 \
+  --val-samples 500 \
+  --output-dir ./checkpoints/run1
 
 # Train (8× H100)
 accelerate launch --num_processes 8 --multi_gpu \
@@ -165,10 +181,10 @@ for batch in loader:
 - **charter_model.py** — `AutoCharterModel`: full encoder-decoder, `.generate()`, `.save_pretrained()`
 
 ### Training (`auto_charter.training`)
-- **dataset.py** — `AutoCharterDataset`: filters missing audio, stratified 80/20 split by instrument
+- **dataset.py** — `AutoCharterDataset`: filters missing audio, stratified 80/20 split by instrument; `StreamingAutoCharterDataset`: lazy IterableDataset for Hub streaming, with `materialize_val()` to snapshot a fixed validation set
 - **collator.py** — `AutoCharterTrainCollator`: computes `beat_ids`, instrument/difficulty tensors, beat timing
 - **metrics.py** — token accuracy, perplexity, note-level F1, beat accuracy
-- **trainer.py** — `AutoCharterTrainer`: Accelerate loop, early stopping, TensorBoard/W&B logging
+- **trainer.py** — `AutoCharterTrainer`: Accelerate loop, early stopping, TensorBoard/W&B logging; detects IterableDataset automatically (disables shuffle, uses `steps_per_epoch` for LR schedule)
 
 ### Dataset (`auto_charter.dataset`)
 - **schema.py** — HuggingFace Features definition (30 fields)
@@ -260,9 +276,14 @@ One row per instrument per song:
 uv run process-dataset -i songs1/ -i songs2/ -o ./dataset/ \
     --extract-logmel --extract-mert --device cuda
 
-# Train model (configure accelerate first: accelerate config)
+# Train from local dataset (configure accelerate first: accelerate config)
 accelerate launch src/auto_charter/scripts/train.py \
     --dataset ./dataset/ --output-dir ./runs/run1
+
+# Train streaming from HuggingFace Hub (no download)
+accelerate launch src/auto_charter/scripts/train.py \
+    --hub-dataset thejorseman/CloneHeroDatasetCharts \
+    --streaming --steps-per-epoch 2000 --output-dir ./runs/run1
 
 # Evaluate on test split
 uv run validate-charter --checkpoint ./runs/run1/best --dataset ./dataset/

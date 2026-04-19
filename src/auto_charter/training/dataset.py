@@ -12,11 +12,12 @@ Train/test split:
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 
 class AutoCharterDataset(Dataset):
@@ -96,6 +97,22 @@ class AutoCharterDataset(Dataset):
             ds = ds[split]
         return cls(ds, **kwargs)
 
+    @classmethod
+    def from_streaming(
+        cls,
+        iterable_dataset,
+        max_tokens: int = 16384,
+        max_beats: int = 1024,
+        min_tokens: int = 10,
+    ) -> "StreamingAutoCharterDataset":
+        """Wrap a HuggingFace IterableDataset for streaming training."""
+        return StreamingAutoCharterDataset(
+            iterable_dataset,
+            max_tokens=max_tokens,
+            max_beats=max_beats,
+            min_tokens=min_tokens,
+        )
+
     @staticmethod
     def train_test_split(
         hf_dataset,
@@ -140,3 +157,65 @@ class AutoCharterDataset(Dataset):
             AutoCharterDataset(train_ds, **dataset_kwargs),
             AutoCharterDataset(test_ds, **dataset_kwargs),
         )
+
+
+class StreamingAutoCharterDataset(IterableDataset):
+    """Streaming PyTorch IterableDataset wrapping a HuggingFace IterableDataset.
+
+    Filters are applied lazily — no data is loaded into memory upfront.
+    Shuffle via HuggingFace's buffer-based shuffle before wrapping.
+
+    Args:
+        iterable_dataset: A datasets.IterableDataset (with streaming=True).
+        max_tokens: Truncate token sequences longer than this.
+        max_beats: Drop rows with more beats than this.
+        min_tokens: Drop rows with fewer tokens than this.
+    """
+
+    def __init__(
+        self,
+        iterable_dataset,
+        max_tokens: int = 16384,
+        max_beats: int = 1024,
+        min_tokens: int = 10,
+    ) -> None:
+        super().__init__()
+        self.max_tokens = max_tokens
+        self.max_beats = max_beats
+        self.min_tokens = min_tokens
+        self._data = iterable_dataset.filter(
+            lambda row: AutoCharterDataset._keep(row, max_beats, min_tokens)
+        )
+
+    def __iter__(self):
+        for row in self._data:
+            yield row
+
+    @classmethod
+    def materialize_val(
+        cls,
+        iterable_dataset,
+        n_samples: int,
+        max_tokens: int = 16384,
+        max_beats: int = 1024,
+        min_tokens: int = 10,
+    ) -> "AutoCharterDataset":
+        """Take `n_samples` from a streaming split and return a regular Dataset.
+
+        Materializing validation avoids re-streaming every eval loop and
+        ensures reproducible validation metrics across epochs.
+        """
+        import datasets as hf_datasets
+
+        filtered = iterable_dataset.filter(
+            lambda row: AutoCharterDataset._keep(row, max_beats, min_tokens)
+        )
+        samples = list(itertools.islice(filtered, n_samples))
+        if not samples:
+            raise ValueError(
+                "No valid samples found in the validation stream after filtering. "
+                "Check that mert/logmel embeddings are present."
+            )
+        hf_ds = hf_datasets.Dataset.from_list(samples)
+        print(f"StreamingAutoCharterDataset: materialized {len(hf_ds)} val samples")
+        return AutoCharterDataset(hf_ds, max_tokens=max_tokens, max_beats=max_beats, min_tokens=min_tokens)

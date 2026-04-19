@@ -26,7 +26,11 @@ import click
 
 
 @click.command()
-@click.option("--dataset", "-d", required=True, type=click.Path(exists=True), help="Path to HuggingFace Arrow dataset")
+@click.option("--dataset", "-d", default=None, type=click.Path(), help="Path to local HuggingFace Arrow dataset")
+@click.option("--hub-dataset", default=None, help="HuggingFace Hub dataset ID (e.g. user/dataset). Use with --streaming.")
+@click.option("--streaming", is_flag=True, help="Stream dataset without downloading (works with --hub-dataset or local parquet shards)")
+@click.option("--steps-per-epoch", default=1000, type=int, show_default=True, help="Training steps per epoch for cosine LR schedule (required when streaming)")
+@click.option("--val-samples", default=500, type=int, show_default=True, help="Validation samples to materialize from the stream")
 @click.option("--output-dir", "-o", required=True, type=click.Path(), help="Directory for checkpoints and logs")
 @click.option("--d-model", default=256, type=int, show_default=True, help="Model hidden dim")
 @click.option("--n-enc-layers", default=4, type=int, show_default=True, help="Number of encoder layers")
@@ -51,7 +55,8 @@ import click
 @click.option("--resume-from", default=None, type=click.Path(), help="Resume from checkpoint directory")
 @click.option("--max-samples", default=None, type=int, show_default=True, help="Limit dataset to N samples (for quick sanity-check runs)")
 def main(
-    dataset, output_dir, d_model, n_enc_layers, n_dec_layers, n_heads, d_ff,
+    dataset, hub_dataset, streaming, steps_per_epoch, val_samples,
+    output_dir, d_model, n_enc_layers, n_dec_layers, n_heads, d_ff,
     dropout, batch_size, grad_accum, num_epochs, lr, warmup_steps, patience,
     test_size, max_tokens, max_beats, use_wandb, mixed_precision, num_workers,
     seed, log_every, resume_from, max_samples,
@@ -62,60 +67,87 @@ def main(
 
     from auto_charter.model.charter_model import AutoCharterModel
     from auto_charter.model.config import AutoCharterConfig
-    from auto_charter.training.dataset import AutoCharterDataset
+    from auto_charter.training.dataset import AutoCharterDataset, StreamingAutoCharterDataset
     from auto_charter.training.trainer import AutoCharterTrainer
+
+    if dataset is None and hub_dataset is None:
+        raise click.UsageError("Provide either --dataset (local path) or --hub-dataset (Hub ID).")
 
     torch.manual_seed(seed)
 
-    # Load and split dataset
-    print(f"Loading dataset from {dataset} ...")
-    dataset_path = Path(dataset)
+    ds_kwargs = dict(max_tokens=max_tokens, max_beats=max_beats)
 
-    # Try to load directly; if it fails, look for a train/ subdirectory
-    # (process-dataset may produce a folder with a train/ split but no dataset_dict.json)
-    try:
-        raw_ds = hf_datasets.load_from_disk(str(dataset_path))
-    except FileNotFoundError:
-        train_subdir = dataset_path / "train"
-        if train_subdir.exists():
-            print(f"  → Not a DatasetDict root; loading split from {train_subdir}")
-            raw_ds = hf_datasets.load_from_disk(str(train_subdir))
-        else:
-            raise
+    # ── Streaming mode ────────────────────────────────────────────────────────
+    if streaming:
+        source = hub_dataset or dataset
+        print(f"Loading dataset in streaming mode from: {source}")
+        raw_ds = hf_datasets.load_dataset(source, streaming=True)
 
-    if max_samples is not None:
-        if isinstance(raw_ds, hf_datasets.DatasetDict):
-            raw_ds = hf_datasets.DatasetDict({
-                k: v.select(range(min(max_samples, len(v)))) for k, v in raw_ds.items()
-            })
+        if isinstance(raw_ds, hf_datasets.IterableDatasetDict):
+            if "train" in raw_ds and ("test" in raw_ds or "validation" in raw_ds):
+                train_split = raw_ds["train"].shuffle(seed=seed, buffer_size=10_000)
+                val_split_key = "test" if "test" in raw_ds else "validation"
+                val_split = raw_ds[val_split_key]
+            else:
+                # Single split — use it for training; materialize val from the same stream
+                only_split = next(iter(raw_ds.values()))
+                train_split = only_split.shuffle(seed=seed, buffer_size=10_000)
+                val_split = only_split
         else:
-            raw_ds = raw_ds.select(range(min(max_samples, len(raw_ds))))
-        print(f"  → Sanity-check mode: dataset limited to {max_samples} samples")
+            train_split = raw_ds.shuffle(seed=seed, buffer_size=10_000)
+            val_split = raw_ds
 
-    if isinstance(raw_ds, hf_datasets.DatasetDict):
-        # If already split, use existing splits
-        if "train" in raw_ds and "test" in raw_ds:
-            train_ds = AutoCharterDataset(raw_ds["train"], max_tokens=max_tokens, max_beats=max_beats)
-            val_ds = AutoCharterDataset(raw_ds["test"], max_tokens=max_tokens, max_beats=max_beats)
-        else:
-            raw_ds = next(iter(raw_ds.values()))
-            train_ds, val_ds = AutoCharterDataset.train_test_split(
-                raw_ds, test_size=test_size, seed=seed,
-                max_tokens=max_tokens, max_beats=max_beats,
-            )
+        train_ds = StreamingAutoCharterDataset(train_split, **ds_kwargs)
+        val_ds = StreamingAutoCharterDataset.materialize_val(val_split, n_samples=val_samples, **ds_kwargs)
+        print(f"Streaming train (unbounded) | Val: {len(val_ds)} samples materialized")
+
+    # ── Normal (in-memory) mode ───────────────────────────────────────────────
     else:
-        train_ds, val_ds = AutoCharterDataset.train_test_split(
-            raw_ds, test_size=test_size, seed=seed,
-            max_tokens=max_tokens, max_beats=max_beats,
-        )
+        if dataset is None:
+            raise click.UsageError("--dataset is required when not using --streaming.")
+        print(f"Loading dataset from {dataset} ...")
+        dataset_path = Path(dataset)
 
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
+        try:
+            raw_ds = hf_datasets.load_from_disk(str(dataset_path))
+        except FileNotFoundError:
+            train_subdir = dataset_path / "train"
+            if train_subdir.exists():
+                print(f"  → Not a DatasetDict root; loading split from {train_subdir}")
+                raw_ds = hf_datasets.load_from_disk(str(train_subdir))
+            else:
+                raise
 
-    if len(train_ds) == 0:
-        raise ValueError(
-            "Training dataset is empty after filtering. "
-            "Make sure your dataset was built with --extract-mert and --extract-logmel."
-        )
+        if max_samples is not None:
+            if isinstance(raw_ds, hf_datasets.DatasetDict):
+                raw_ds = hf_datasets.DatasetDict({
+                    k: v.select(range(min(max_samples, len(v)))) for k, v in raw_ds.items()
+                })
+            else:
+                raw_ds = raw_ds.select(range(min(max_samples, len(raw_ds))))
+            print(f"  → Sanity-check mode: dataset limited to {max_samples} samples")
+
+        if isinstance(raw_ds, hf_datasets.DatasetDict):
+            if "train" in raw_ds and "test" in raw_ds:
+                train_ds = AutoCharterDataset(raw_ds["train"], **ds_kwargs)
+                val_ds = AutoCharterDataset(raw_ds["test"], **ds_kwargs)
+            else:
+                raw_ds = next(iter(raw_ds.values()))
+                train_ds, val_ds = AutoCharterDataset.train_test_split(
+                    raw_ds, test_size=test_size, seed=seed, **ds_kwargs,
+                )
+        else:
+            train_ds, val_ds = AutoCharterDataset.train_test_split(
+                raw_ds, test_size=test_size, seed=seed, **ds_kwargs,
+            )
+
+        print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
+
+        if len(train_ds) == 0:
+            raise ValueError(
+                "Training dataset is empty after filtering. "
+                "Make sure your dataset was built with --extract-mert and --extract-logmel."
+            )
 
     # Build model config
     config = AutoCharterConfig(
@@ -153,6 +185,7 @@ def main(
         num_workers=num_workers,
         mixed_precision=mixed_precision,
         resume_from=Path(resume_from) if resume_from else None,
+        steps_per_epoch=steps_per_epoch if streaming else 0,
     )
     trainer.train()
 

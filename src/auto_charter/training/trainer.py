@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from auto_charter.model.charter_model import AutoCharterModel
 from auto_charter.model.config import AutoCharterConfig
@@ -72,6 +72,7 @@ class AutoCharterTrainer:
         num_workers: int = 0,
         mixed_precision: str = "bf16",  # "bf16", "fp16", or "no"
         resume_from: Optional[Path] = None,
+        steps_per_epoch: int = 0,      # required when train_dataset is IterableDataset
     ) -> None:
         from accelerate import Accelerator
         from accelerate.utils import ProjectConfiguration
@@ -100,10 +101,11 @@ class AutoCharterTrainer:
             max_beats=self.config.max_beats,
         )
 
+        _train_is_streaming = isinstance(train_dataset, IterableDataset)
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=not _train_is_streaming,
             collate_fn=collator,
             num_workers=num_workers,
             pin_memory=False,
@@ -137,9 +139,10 @@ class AutoCharterTrainer:
         ]
         self.optimizer = torch.optim.AdamW(param_groups, lr=self.config.learning_rate)
 
-        total_steps = (
-            len(self.train_loader) * num_epochs // grad_accum_steps
-        )
+        if steps_per_epoch > 0:
+            total_steps = steps_per_epoch * num_epochs // grad_accum_steps
+        else:
+            total_steps = len(self.train_loader) * num_epochs // grad_accum_steps
         from transformers import get_cosine_schedule_with_warmup
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
@@ -180,7 +183,10 @@ class AutoCharterTrainer:
         if self.accelerator.is_main_process:
             n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             print(f"Training AutoCharterModel ({n_params:,} parameters)")
-            print(f"Train batches: {len(self.train_loader)}, Val batches: {len(self.val_loader)}")
+            try:
+                print(f"Train batches: {len(self.train_loader)}, Val batches: {len(self.val_loader)}")
+            except TypeError:
+                print("Train batches: (streaming — unknown), Val batches: (streaming — unknown)")
 
         for epoch in range(self.num_epochs):
             epoch_loss = self._train_epoch(epoch)
