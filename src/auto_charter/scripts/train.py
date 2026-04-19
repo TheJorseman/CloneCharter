@@ -68,7 +68,7 @@ def main(
 
     from auto_charter.model.charter_model import AutoCharterModel
     from auto_charter.model.config import AutoCharterConfig
-    from auto_charter.training.dataset import AutoCharterDataset, StreamingAutoCharterDataset
+    from auto_charter.training.dataset import AutoCharterDataset, StreamingAutoCharterDataset, ShardedParquetDataset
     from auto_charter.training.trainer import AutoCharterTrainer
 
     if dataset is None and hub_dataset is None:
@@ -83,37 +83,36 @@ def main(
         source = hub_dataset or dataset
         print(f"Loading dataset in streaming mode from: {source}")
         source_path = Path(source) if source else None
-        if source_path and source_path.exists():
-            parquet_files = sorted(source_path.glob("*.parquet"))
-            if parquet_files:
-                raw_ds = hf_datasets.load_dataset(
-                    "parquet",
-                    data_files={"train": str(source_path / "*.parquet")},
-                    streaming=True,
-                )
-            else:
-                raw_ds = hf_datasets.load_dataset(source, streaming=True)
+
+        # Local parquet shards → ShardedParquetDataset (flat RAM, no HF caching)
+        if source_path and source_path.exists() and list(source_path.glob("*.parquet")):
+            train_ds, val_ds = ShardedParquetDataset.train_val_split(
+                source_path,
+                val_shards=max(1, val_samples // 20),  # ~20 rows/shard on average
+                seed=seed,
+                **ds_kwargs,
+            )
+            print(f"Sharded streaming | Val: {len(val_ds)} rows (RAM: 1 shard at a time)")
+
+        # HuggingFace Hub → HF streaming with shuffle buffer
         else:
             raw_ds = hf_datasets.load_dataset(source, streaming=True)
-
-        if isinstance(raw_ds, hf_datasets.IterableDatasetDict):
-            if "train" in raw_ds and ("test" in raw_ds or "validation" in raw_ds):
-                train_split = raw_ds["train"].shuffle(seed=seed, buffer_size=shuffle_buffer)
-                val_split_key = "test" if "test" in raw_ds else "validation"
-                val_split = raw_ds[val_split_key]
+            if isinstance(raw_ds, hf_datasets.IterableDatasetDict):
+                if "train" in raw_ds and ("test" in raw_ds or "validation" in raw_ds):
+                    train_split = raw_ds["train"].shuffle(seed=seed, buffer_size=shuffle_buffer)
+                    val_split_key = "test" if "test" in raw_ds else "validation"
+                    val_split = raw_ds[val_split_key]
+                else:
+                    only_split = next(iter(raw_ds.values()))
+                    train_split = only_split.shuffle(seed=seed, buffer_size=shuffle_buffer)
+                    val_split = only_split
             else:
-                only_split = next(iter(raw_ds.values()))
-                train_split = only_split.shuffle(seed=seed, buffer_size=shuffle_buffer)
-                val_split = only_split
-        else:
-            train_split = raw_ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
-            val_split = raw_ds
-
-        print(f"  → Shuffle buffer: {shuffle_buffer} rows (~{shuffle_buffer * 8 / 1024:.1f} GB RAM estimated)")
-
-        train_ds = StreamingAutoCharterDataset(train_split, **ds_kwargs)
-        val_ds = StreamingAutoCharterDataset.materialize_val(val_split, n_samples=val_samples, **ds_kwargs)
-        print(f"Streaming train (unbounded) | Val: {len(val_ds)} samples materialized")
+                train_split = raw_ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
+                val_split = raw_ds
+            print(f"  → Hub shuffle buffer: {shuffle_buffer} rows (~{shuffle_buffer * 8 / 1024:.1f} GB RAM)")
+            train_ds = StreamingAutoCharterDataset(train_split, **ds_kwargs)
+            val_ds = StreamingAutoCharterDataset.materialize_val(val_split, n_samples=val_samples, **ds_kwargs)
+            print(f"Hub streaming | Val: {len(val_ds)} samples materialized")
 
     # ── Normal (in-memory) mode ───────────────────────────────────────────────
     else:

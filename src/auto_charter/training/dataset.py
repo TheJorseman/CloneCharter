@@ -12,7 +12,9 @@ Train/test split:
 
 from __future__ import annotations
 
+import gc
 import itertools
+import random
 from pathlib import Path
 from typing import Any
 
@@ -219,3 +221,131 @@ class StreamingAutoCharterDataset(IterableDataset):
         hf_ds = hf_datasets.Dataset.from_list(samples)
         print(f"StreamingAutoCharterDataset: materialized {len(hf_ds)} val samples")
         return AutoCharterDataset(hf_ds, max_tokens=max_tokens, max_beats=max_beats, min_tokens=min_tokens)
+
+
+class ShardedParquetDataset(IterableDataset):
+    """Streams local parquet shards one file at a time with explicit memory release.
+
+    Unlike HuggingFace streaming (which caches Arrow buffers internally and leaks
+    RAM linearly), this class loads one shard, yields its rows, deletes the table,
+    and calls gc.collect() before moving to the next shard. RAM stays flat.
+
+    Shuffle is shard-level (shard order is randomized each epoch) plus optional
+    row-level shuffle within each shard — no global shuffle buffer needed.
+    """
+
+    def __init__(
+        self,
+        shard_paths: list[Path],
+        max_tokens: int = 16384,
+        max_beats: int = 1024,
+        min_tokens: int = 10,
+        shuffle: bool = True,
+        seed: int = 42,
+    ) -> None:
+        super().__init__()
+        self.shard_paths = list(shard_paths)
+        self.max_tokens = max_tokens
+        self.max_beats = max_beats
+        self.min_tokens = min_tokens
+        self.shuffle = shuffle
+        self.seed = seed
+
+    def __iter__(self):
+        import pyarrow.parquet as pq
+
+        shards = list(self.shard_paths)
+        rng = random.Random(self.seed)
+        if self.shuffle:
+            rng.shuffle(shards)
+
+        for shard_path in shards:
+            table = pq.read_table(shard_path)
+            col_names = table.schema.names
+            rows = [
+                {col: table.column(col)[i].as_py() for col in col_names}
+                for i in range(table.num_rows)
+            ]
+            del table
+            gc.collect()
+
+            if self.shuffle:
+                rng.shuffle(rows)
+
+            for row in rows:
+                if AutoCharterDataset._keep(row, self.max_beats, self.min_tokens):
+                    yield row
+
+            del rows
+            gc.collect()
+
+    @classmethod
+    def from_directory(
+        cls,
+        directory: Path | str,
+        pattern: str = "*.parquet",
+        **kwargs,
+    ) -> "ShardedParquetDataset":
+        paths = sorted(Path(directory).glob(pattern))
+        if not paths:
+            raise FileNotFoundError(f"No parquet files found in {directory}")
+        print(f"ShardedParquetDataset: found {len(paths)} shards in {directory}")
+        return cls(paths, **kwargs)
+
+    @classmethod
+    def train_val_split(
+        cls,
+        directory: Path | str,
+        val_shards: int = 10,
+        pattern: str = "*.parquet",
+        seed: int = 42,
+        max_tokens: int = 16384,
+        max_beats: int = 1024,
+        min_tokens: int = 10,
+    ) -> tuple["ShardedParquetDataset", "AutoCharterDataset"]:
+        """Split shard list into train/val without loading all data into RAM.
+
+        Val shards are fully materialized (small fixed set). Train shards stream
+        one file at a time — RAM stays flat throughout training.
+        """
+        import pyarrow.parquet as pq
+        import datasets as hf_datasets
+
+        paths = sorted(Path(directory).glob(pattern))
+        if not paths:
+            raise FileNotFoundError(f"No parquet files found in {directory}")
+
+        rng = random.Random(seed)
+        shuffled = list(paths)
+        rng.shuffle(shuffled)
+        val_paths = shuffled[:val_shards]
+        train_paths = shuffled[val_shards:]
+
+        print(f"ShardedParquetDataset: {len(train_paths)} train shards, {len(val_paths)} val shards")
+
+        ds_kwargs = dict(max_tokens=max_tokens, max_beats=max_beats, min_tokens=min_tokens)
+
+        # Materialize val rows from the reserved shards
+        val_rows = []
+        for p in val_paths:
+            table = pq.read_table(p)
+            col_names = table.schema.names
+            for i in range(table.num_rows):
+                row = {col: table.column(col)[i].as_py() for col in col_names}
+                if AutoCharterDataset._keep(row, max_beats, min_tokens):
+                    val_rows.append(row)
+            del table
+            gc.collect()
+
+        if not val_rows:
+            raise ValueError("No valid rows found in val shards after filtering.")
+
+        val_hf = hf_datasets.Dataset.from_list(val_rows)
+        del val_rows
+        gc.collect()
+
+        print(f"  → Val materialized: {len(val_hf)} rows")
+
+        train_ds = cls(train_paths, shuffle=True, seed=seed, **ds_kwargs)
+        val_ds = AutoCharterDataset(val_hf, **ds_kwargs)
+        return train_ds, val_ds
