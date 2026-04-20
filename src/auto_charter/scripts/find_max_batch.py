@@ -11,6 +11,11 @@ Usage:
 from __future__ import annotations
 
 import gc
+import sys
+from pathlib import Path
+
+# Allow running directly with: python find_max_batch.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import click
 import torch
