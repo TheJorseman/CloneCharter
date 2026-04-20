@@ -1,10 +1,5 @@
 """AutoCharterDataset — wraps a HuggingFace Arrow dataset for model training.
 
-Filtering:
-  - Drops rows with empty mert_embeddings or logmel_frames (not extracted)
-  - Drops rows with difficulty == -1 (uncharted)
-  - Optionally drops rows exceeding max_beats or below min_tokens
-
 Train/test split:
   - Stratified by instrument (guitar/bass/drums) to guarantee all three
     appear in both splits even with a small dataset.
@@ -31,26 +26,10 @@ from torch.utils.data import Dataset, IterableDataset, Sampler
 
 # ── Subprocess helpers (must be module-level to be picklable on Windows) ──────
 
-def _row_is_valid(row: dict, max_beats: int, min_tokens: int) -> bool:
-    if row.get("difficulty", -1) == -1:
-        return False
-    mert = row.get("mert_embeddings")
-    logmel = row.get("logmel_frames")
-    if mert is None or logmel is None or len(mert) == 0 or len(logmel) == 0:
-        return False
-    if row.get("num_beats", 0) > max_beats:
-        return False
-    if len(row.get("tokens", [])) < min_tokens:
-        return False
-    return True
-
-
 def _worker_main(
     shard_paths: list[str],
     out_queue,
     window_size: int,
-    max_beats: int,
-    min_tokens: int,
     shuffle: bool,
     seed: int,
 ) -> None:
@@ -108,9 +87,7 @@ def _worker_main(
                 continue
             col_names = list(df.columns)
             for i in range(len(df)):
-                row = {col: df[col].iat[i] for col in col_names}
-                if _row_is_valid(row, max_beats, min_tokens):
-                    rows.append(row)
+                rows.append({col: df[col].iat[i] for col in col_names})
             del df
             gc.collect()
 
@@ -152,32 +129,8 @@ class AutoCharterDataset(Dataset):
         self.max_tokens = max_tokens
         self.max_beats = max_beats
         self.min_tokens = min_tokens
-
-        filtered = hf_dataset.filter(
-            lambda row: self._keep(row, max_beats, min_tokens),
-            desc="Filtering dataset",
-            num_proc=1,  # no worker spawn — prevents RAM spikes from process forking
-        )
-        self._data = filtered
-        print(
-            f"AutoCharterDataset: {len(hf_dataset)} rows → {len(filtered)} after filtering"
-        )
-
-    @staticmethod
-    def _keep(row: dict, max_beats: int, min_tokens: int) -> bool:
-        if row.get("difficulty", -1) == -1:
-            return False
-        mert = row.get("mert_embeddings")
-        logmel = row.get("logmel_frames")
-        if mert is None or logmel is None or len(mert) == 0 or len(logmel) == 0:
-            return False
-        num_beats = row.get("num_beats", 0)
-        if num_beats > max_beats:
-            return False
-        tokens = row.get("tokens", [])
-        if len(tokens) < min_tokens:
-            return False
-        return True
+        self._data = hf_dataset
+        print(f"AutoCharterDataset: {len(hf_dataset)} rows")
 
     def __len__(self) -> int:
         return len(self._data)
@@ -269,9 +222,7 @@ class StreamingAutoCharterDataset(IterableDataset):
         self.max_tokens = max_tokens
         self.max_beats = max_beats
         self.min_tokens = min_tokens
-        self._data = iterable_dataset.filter(
-            lambda row: AutoCharterDataset._keep(row, max_beats, min_tokens)
-        )
+        self._data = iterable_dataset
 
     def __iter__(self):
         for row in self._data:
@@ -288,14 +239,9 @@ class StreamingAutoCharterDataset(IterableDataset):
     ) -> "AutoCharterDataset":
         import datasets as hf_datasets
 
-        filtered = iterable_dataset.filter(
-            lambda row: AutoCharterDataset._keep(row, max_beats, min_tokens)
-        )
-        samples = list(itertools.islice(filtered, n_samples))
+        samples = list(itertools.islice(iterable_dataset, n_samples))
         if not samples:
-            raise ValueError(
-                "No valid samples found in the validation stream after filtering."
-            )
+            raise ValueError("No samples found in the validation stream.")
         hf_ds = hf_datasets.Dataset.from_list(samples)
         print(f"StreamingAutoCharterDataset: materialized {len(hf_ds)} val samples")
         return AutoCharterDataset(hf_ds, max_tokens=max_tokens, max_beats=max_beats, min_tokens=min_tokens)
@@ -355,8 +301,6 @@ class ShardedParquetDataset(IterableDataset):
                 self.shard_paths,
                 queue,
                 self.window_size,
-                self.max_beats,
-                self.min_tokens,
                 self.shuffle,
                 self.seed,
             ),
@@ -423,15 +367,14 @@ class ShardedParquetDataset(IterableDataset):
         val_rows: list[dict] = []
         for p in val_paths:
             df = pd.read_parquet(str(p))
+            cols = list(df.columns)
             for i in range(len(df)):
-                row = {col: df[col].iat[i] for col in df.columns}
-                if _row_is_valid(row, max_beats, min_tokens):
-                    val_rows.append(row)
+                val_rows.append({col: df[col].iat[i] for col in cols})
             del df
             gc.collect()
 
         if not val_rows:
-            raise ValueError("No valid rows in val shards after filtering.")
+            raise ValueError("No rows found in val shards.")
 
         val_hf = hf_datasets.Dataset.from_list(val_rows)
         del val_rows
