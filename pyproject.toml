@@ -47,6 +47,7 @@ validate-charter = "auto_charter.scripts.validate:main"
 demo-charter     = "auto_charter.scripts.gradio_demo:main"
 push-dataset     = "auto_charter.scripts.push_dataset:main"
 debug-ram        = "auto_charter.scripts.debug_ram:main"
+find-max-batch   = "auto_charter.scripts.find_max_batch:main"
 
 [build-system]
 requires = ["hatchling"]
