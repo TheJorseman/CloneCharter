@@ -27,23 +27,24 @@ def find_song_dirs(root: Path, recursive: bool = True) -> list[Path]:
     """Find all song directories under root.
 
     A song directory contains notes.chart or notes.mid (and usually song.ini).
+    Uses os.walk for fast directory traversal (much faster than Path.glob on
+    large folder trees with 10k+ directories).
     """
-    songs: list[Path] = []
-    pattern = "**/" if recursive else ""
+    import os
 
-    for fname in ("notes.chart", "notes.mid"):
-        for chart_file in root.glob(f"{pattern}{fname}"):
-            songs.append(chart_file.parent)
+    _CHART_FILES = {"notes.chart", "notes.mid"}
+    # Work with plain strings throughout — avoid creating Path objects in the
+    # inner loop (33k+ iterations) and defer conversion to the final step.
+    seen: set[str] = set()
 
-    # Deduplicate while preserving discovery order
-    seen: set[Path] = set()
-    unique: list[Path] = []
-    for p in songs:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
+    for dirpath, _dirs, files in os.walk(str(root)):
+        if not recursive:
+            _dirs.clear()
+        # set.intersection on two small sets is O(1) in practice
+        if _CHART_FILES.intersection(files):
+            seen.add(dirpath)
 
-    return sorted(unique)
+    return sorted(Path(p) for p in seen)
 
 
 # ─── Checkpoint and incremental saving ────────────────────────────────────────
@@ -63,25 +64,213 @@ def save_processed_song(song_dir: Path, checkpoint_file: Path) -> None:
         f.write(str(song_dir.absolute()) + "\n")
 
 
-def save_rows_to_jsonl(rows: list[dict], jsonl_file: Path) -> None:
-    """Append rows to a JSON Lines file."""
-    with open(jsonl_file, "a", encoding="utf-8") as f:
+class ParquetShardWriter:
+    """Write dataset rows directly to Parquet shards without an intermediate JSONL file.
+
+    Rows are buffered and flushed when the estimated buffer size exceeds
+    `max_shard_mb` MB. This keeps peak RAM usage bounded regardless of how
+    many beats each song has (mert+logmel arrays vary greatly in size).
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        split: str,
+        compression: str = "zstd",
+        max_shard_mb: int = 256,
+    ) -> None:
+        self.output_dir = output_dir
+        self.split = split
+        self.compression = compression if compression != "none" else None
+        self._max_shard_bytes = max_shard_mb * 1024 * 1024
+        self._buffer: list[dict] = []
+        self._buffer_bytes: int = 0
+        self._shard_index = 0
+        self._total_rows = 0
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # Resume: start shard index after any existing shards
+        existing = sorted(output_dir.glob(f"{split}-*.parquet"))
+        if existing:
+            # Extract the highest index from filenames like "train-00003.parquet"
+            try:
+                last = int(existing[-1].stem.split("-")[-1])
+                self._shard_index = last + 1
+            except ValueError:
+                self._shard_index = len(existing)
+            logger.info(
+                "ParquetShardWriter: resuming at shard %d (%d existing shards).",
+                self._shard_index, len(existing),
+            )
+
+    @staticmethod
+    def _estimate_row_bytes(row: dict) -> int:
+        """Rough byte estimate for a row based on its float arrays."""
+        n_beats = row.get("num_beats", 0)
+        mert = n_beats * 768 * 4          # float32
+        logmel = n_beats * 32 * 128 * 4   # float32
+        tokens = row.get("num_tokens", 0) * 4
+        return mert + logmel + tokens + 512  # 512 bytes overhead for metadata
+
+    def add(self, rows: list[dict]) -> None:
+        """Add rows to the buffer, flushing when buffer exceeds the byte limit."""
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            self._buffer.append(row)
+            self._buffer_bytes += self._estimate_row_bytes(row)
+            if self._buffer_bytes >= self._max_shard_bytes:
+                self._flush(self._buffer)
+                self._buffer = []
+                self._buffer_bytes = 0
+
+    @staticmethod
+    def _hf_features_to_arrow_schema():
+        """Return a PyArrow schema matching the HuggingFace Features definition."""
+        try:
+            import pyarrow as pa
+            from auto_charter.dataset.schema import get_features
+            features = get_features()
+            return features.arrow_schema
+        except Exception:
+            return None  # fall back to inference
+
+    def _flush(self, rows: list[dict]) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            raise ImportError("pyarrow is required: pip install pyarrow")
+
+        hf_schema = self._hf_features_to_arrow_schema()
+        if hf_schema is not None:
+            # Write with HF schema: ensures list fields use 'item' naming (not PyArrow's
+            # default 'element'), which is required for Dataset.from_parquet() to load.
+            table = pa.Table.from_pylist(rows, schema=hf_schema)
+        else:
+            # Fallback: infer schema from data, then cast list<element:x> -> list<item:x>
+            # so the output is compatible with HuggingFace datasets regardless of PyArrow version.
+            logger.warning(
+                "HF schema unavailable — writing shard with inferred schema. "
+                "Run repair_shards.py on the output if Dataset.from_parquet fails."
+            )
+            table = pa.Table.from_pylist(rows)
+            # Cast inferred list types to use 'item' naming
+            item_schema = pa.schema([
+                pa.field(f.name, self._list_element_to_item(f.type), nullable=f.nullable)
+                for f in table.schema
+            ])
+            try:
+                table = table.cast(item_schema)
+            except Exception:
+                pass  # leave as-is if cast fails; repair_shards can fix later
+
+        path = self.output_dir / f"{self.split}-{self._shard_index:05d}.parquet"
+        pq.write_table(table, str(path), compression=self.compression)
+        self._total_rows += len(rows)
+        self._shard_index += 1
+        logger.debug("Wrote shard %s (%d rows)", path.name, len(rows))
+
+    @staticmethod
+    def _list_element_to_item(t) -> "pa.DataType":
+        """Recursively replace list<element:x> with list<item:x>."""
+        import pyarrow as pa
+        if pa.types.is_list(t):
+            return pa.list_(ParquetShardWriter._list_element_to_item(t.value_type))
+        if pa.types.is_large_list(t):
+            return pa.large_list(ParquetShardWriter._list_element_to_item(t.value_type))
+        return t
+
+    def close(self) -> int:
+        """Flush remaining buffered rows and return total rows written."""
+        if self._buffer:
+            self._flush(self._buffer)
+            self._buffer = []
+        return self._total_rows
+
+    @property
+    def total_rows(self) -> int:
+        return self._total_rows + len(self._buffer)
+
+    def shard_paths(self) -> list[Path]:
+        return sorted(self.output_dir.glob(f"{self.split}-*.parquet"))
 
 
-def load_all_rows_from_jsonl(jsonl_file: Path) -> list[dict]:
-    """Load all rows from a JSON Lines file."""
-    if not jsonl_file.exists():
-        return []
-    rows = []
-    with open(jsonl_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
+def _diagnose_parquet_shards(shards: list[Path]) -> list[Path]:
+    """Try loading each shard with datasets.Dataset to find bad ones. Returns bad shard paths."""
+    from datasets import Dataset
 
+    bad: list[Path] = []
+    for shard in shards:
+        try:
+            Dataset.from_parquet(str(shard))
+        except Exception as exc:
+            bad.append(shard)
+            logger.error("  BAD SHARD %s: %s", shard.name, exc)
+
+    if not bad:
+        logger.error(
+            "All %d shards load individually — the failure happens only when loading them together. "
+            "This usually means one shard has incompatible Arrow list sizes (e.g. logmel shape mismatch). "
+            "Try running with --log-level DEBUG and check for MERT/logmel shape warnings.",
+            len(shards),
+        )
+    else:
+        logger.error("%d bad shard(s) identified. Delete them and re-run with --resume to reprocess.", len(bad))
+        for p in bad:
+            logger.error("  delete: %s", p)
+    return bad
+
+
+def load_dataset_from_parquet_shards(parquet_dir: Path, split: str) -> "Dataset":
+    """Load a HuggingFace Dataset from all Parquet shards via PyArrow.
+
+    Uses PyArrow directly instead of Dataset.from_parquet() to avoid:
+      - HuggingFace cache writes (~/.cache/huggingface/datasets) which can fill disk
+      - 'element' vs 'item' list field naming incompatibility between Parquet spec and HF schema
+
+    Falls back to per-shard loading + concat if bulk read fails.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from datasets import Dataset
+
+    shards = sorted(parquet_dir.glob(f"{split}-*.parquet"))
+    if not shards:
+        raise FileNotFoundError(f"No Parquet shards found in {parquet_dir}")
+    paths = [str(p) for p in shards]
+
+    # 1. Bulk PyArrow load -> Dataset (no HF cache, no element/item issues)
+    try:
+        table = pq.read_table(paths)
+        return Dataset(table)
+    except Exception as e:
+        logger.warning("PyArrow bulk load failed (%s) — falling back to shard-by-shard.", e)
+
+    # 4. Load each shard individually via PyArrow and concatenate
+    tables: list[pa.Table] = []
+    failed: list[Path] = []
+    for shard in shards:
+        try:
+            tables.append(pq.read_table(str(shard)))
+        except Exception as exc:
+            failed.append(shard)
+            logger.error("  Skipping bad shard %s: %s", shard.name, exc)
+
+    if failed:
+        logger.error(
+            "%d shard(s) could not be read. Delete them and re-run with --resume to reprocess.",
+            len(failed),
+        )
+        for p in failed:
+            logger.error("  delete: %s", p)
+
+    if not tables:
+        _diagnose_parquet_shards(shards)
+        raise RuntimeError(f"All {len(shards)} Parquet shards failed to load.")
+
+    combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    return Dataset(combined)
+
+
+# ── Legacy JSONL helpers (kept for backwards-compatibility with existing outputs) ──
 
 def load_dataset_from_jsonl(jsonl_file: Path, features=None) -> "Dataset":
     """Load dataset directly from JSONL without intermediate list (memory efficient)."""
@@ -94,8 +283,14 @@ def load_dataset_from_jsonl(jsonl_file: Path, features=None) -> "Dataset":
         logger.warning(
             "Could not load dataset from JSONL (%s) — falling back to list loading.", e
         )
-        # Fallback to original method for compatibility
-        rows = load_all_rows_from_jsonl(jsonl_file)
+        rows = []
+        with open(jsonl_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    import json as _json
+                    rows.append(_json.loads(line))
+        from datasets import Dataset
         return (
             Dataset.from_list(rows, features=features)
             if features
@@ -118,6 +313,8 @@ class ProcessingConfig:
     logmel_target_frames: int
     include_beat_boundaries: bool
     force_reseparate: bool
+    delete_stems_after: bool = False
+    max_duration_s: float = 0.0  # 0 = no limit; drop songs longer than this
 
 
 @dataclass
@@ -192,6 +389,17 @@ def process_song(
         chart.bpm_map.beat_times(end_tick)
     )
     num_beats = len(beat_ticks)
+
+    # ── 3b. Duration guard — drop songs that are too long ─────────────────────
+    if cfg.max_duration_s > 0 and len(beat_times_s) > 0:
+        estimated_duration_s = float(beat_times_s[-1]) + float(beat_durations_s[-1])
+        if estimated_duration_s > cfg.max_duration_s:
+            result.skipped = True
+            logger.debug(
+                "[%s] Skipped: duration %.1fs > max %.1fs",
+                song_dir.name, estimated_duration_s, cfg.max_duration_s,
+            )
+            return result
 
     # ── 4. Stem resolution (Demucs if needed) ──────────────────────────────────
     instruments_in_chart = [
@@ -283,6 +491,20 @@ def process_song(
                         "[%s/%s] Log-mel error: %s", song_dir.name, instrument, e
                     )
 
+        # Skip rows with missing required audio features
+        if not logmel_frames:
+            logger.warning(
+                "[%s/%s] Skipping: logmel_frames is empty (no audio or extraction failed).",
+                song_dir.name, instrument,
+            )
+            continue
+        if cfg.extract_mert and not mert_embeddings:
+            logger.warning(
+                "[%s/%s] Skipping: mert_embeddings is empty (MERT extraction failed).",
+                song_dir.name, instrument,
+            )
+            continue
+
         # Difficulty
         difficulty = -1
         if meta:
@@ -338,6 +560,28 @@ def process_song(
             "bpm_std": stats["bpm_std"],
         }
         result.rows.append(row)
+
+    # ── 6. Borrar stems generados por Demucs (opcional) ───────────────────────
+    if cfg.delete_stems_after and cfg.separate_stems and result.separation_done:
+        stems_dir = (
+            (cfg.stems_cache / song_dir.name)
+            if cfg.stems_cache
+            else (song_dir / ".stems")
+        )
+        deleted_mb = 0.0
+        for wav in stems_dir.glob("*.wav"):
+            try:
+                deleted_mb += wav.stat().st_size / (1024 * 1024)
+                wav.unlink()
+            except Exception as e:
+                logger.warning("[%s] No se pudo borrar %s: %s", song_dir.name, wav.name, e)
+        # Borrar el directorio si quedó vacío
+        try:
+            stems_dir.rmdir()
+        except OSError:
+            pass  # no estaba vacío o no existe
+        if deleted_mb > 0:
+            logger.debug("[%s] Stems borrados: %.1f MB", song_dir.name, deleted_mb)
 
     result.duration_s = time.perf_counter() - t0
     return result
@@ -398,6 +642,12 @@ def process_song(
     help="Re-run Demucs even when stem files already exist.",
 )
 @click.option(
+    "--delete-stems",
+    is_flag=True,
+    default=False,
+    help="Borrar los WAV generados por Demucs tras extraer los features (ahorra espacio).",
+)
+@click.option(
     "--demucs-model",
     default="htdemucs",
     show_default=True,
@@ -411,7 +661,7 @@ def process_song(
 )
 @click.option(
     "--mert-model",
-    default="m-a-p/MERT-v1-95M",
+    default="m-a-p/MERT-v1-330M",
     show_default=True,
     help="HuggingFace MERT model ID.",
 )
@@ -452,6 +702,14 @@ def process_song(
     help="Stop after processing N songs (0 = no limit, useful for testing).",
 )
 @click.option(
+    "--max-duration-s",
+    default=0.0,
+    type=float,
+    show_default=True,
+    help="Drop songs whose estimated duration exceeds this many seconds (0 = no limit). "
+         "Checked from the beat grid before any audio is loaded.",
+)
+@click.option(
     "--resume/--no-resume",
     default=True,
     show_default=True,
@@ -464,23 +722,11 @@ def process_song(
     help="Remove existing checkpoint and JSONL before starting (start fresh).",
 )
 @click.option(
-    "--parquet-export",
-    is_flag=True,
-    default=False,
-    help="Export dataset as single Parquet file alongside Arrow format.",
-)
-@click.option(
     "--parquet-compression",
     default="zstd",
     type=click.Choice(["snappy", "gzip", "zstd", "none"]),
     show_default=True,
-    help="Compression algorithm for Parquet export.",
-)
-@click.option(
-    "--parquet-output-dir",
-    default=None,
-    type=click.Path(file_okay=False),
-    help="Directory for Parquet export (default: same as output-dir).",
+    help="Compression for Parquet shards (written incrementally during processing).",
 )
 @click.option(
     "--generate-readme",
@@ -503,6 +749,7 @@ def main(
     separate_stems: bool,
     stems_cache: str | None,
     force_reseparate: bool,
+    delete_stems: bool,
     demucs_model: str,
     extract_mert: bool,
     mert_model: str,
@@ -512,11 +759,10 @@ def main(
     no_beat_tokens: bool,
     recursive: bool,
     max_songs: int,
+    max_duration_s: float,
     resume: bool,
     clean: bool,
-    parquet_export: bool,
     parquet_compression: str,
-    parquet_output_dir: str | None,
     generate_readme: bool,
     log_level: str,
 ) -> None:
@@ -563,13 +809,29 @@ def main(
         logmel_target_frames=32,
         include_beat_boundaries=not no_beat_tokens,
         force_reseparate=force_reseparate,
+        delete_stems_after=delete_stems,
+        max_duration_s=max_duration_s,
     )
 
     # ── Discover songs ─────────────────────────────────────────────────────────
-    all_song_dirs: list[Path] = []
-    for d in input_dir:
-        found = find_song_dirs(Path(d), recursive=recursive)
-        all_song_dirs.extend(found)
+    song_list_cache = Path(output_dir) / "song_list.txt" if output_dir else None
+
+    if song_list_cache and song_list_cache.exists() and not clean:
+        click.echo(f"Loading song list from cache: {song_list_cache}")
+        with open(song_list_cache, "r", encoding="utf-8") as f:
+            all_song_dirs = [Path(l.strip()) for l in f if l.strip()]
+        click.echo(f"  {len(all_song_dirs)} songs loaded from cache.")
+    else:
+        all_song_dirs = []
+        for d in input_dir:
+            click.echo(f"Scanning {d} ... (this may take a while on HDD)")
+            found = find_song_dirs(Path(d), recursive=recursive)
+            all_song_dirs.extend(found)
+            click.echo(f"  {len(found)} songs found.")
+        if song_list_cache:
+            with open(song_list_cache, "w", encoding="utf-8") as f:
+                f.writelines(str(p) + "\n" for p in all_song_dirs)
+            click.echo(f"Song list cached to {song_list_cache}")
 
     # Deduplicate across input directories
     seen: set[Path] = set()
@@ -602,19 +864,21 @@ def main(
     # ── Checkpoint setup ───────────────────────────────────────────────────────
     checkpoint_dir = None
     checkpoint_file = None
-    rows_jsonl_file = None
+    parquet_shard_dir = None
+    shard_writer: ParquetShardWriter | None = None
     if output_dir:
         checkpoint_dir = Path(output_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_file = checkpoint_dir / "processed_songs.txt"
-        rows_jsonl_file = checkpoint_dir / "dataset_rows.jsonl"
+        parquet_shard_dir = checkpoint_dir / "shards"
 
         if clean:
+            import shutil
             if checkpoint_file.exists():
                 checkpoint_file.unlink()
-            if rows_jsonl_file.exists():
-                rows_jsonl_file.unlink()
-            click.echo("Cleaned existing checkpoint and JSONL.")
+            if parquet_shard_dir.exists():
+                shutil.rmtree(parquet_shard_dir)
+            click.echo("Cleaned existing checkpoint and Parquet shards.")
     else:
         if resume:
             click.echo("WARNING: --resume requires --output-dir. Disabling resume.")
@@ -640,46 +904,30 @@ def main(
 
     if not songs_to_process:
         click.echo("All songs already processed. Nothing to do.")
-        # Still we need to load existing rows and build dataset
-        if rows_jsonl_file and rows_jsonl_file.exists():
-            # Try efficient loading first
+        if parquet_shard_dir and parquet_shard_dir.exists():
             try:
-                dataset = load_dataset_from_jsonl(rows_jsonl_file)
-                if len(dataset) == 0:
-                    click.echo("No rows found in JSONL file.")
-                    return
-                click.echo(
-                    f"Loaded {len(dataset)} existing rows efficiently from JSONL."
+                dataset = load_dataset_from_parquet_shards(parquet_shard_dir, split)
+                click.echo(f"Loaded {len(dataset)} existing rows from Parquet shards.")
+                _build_and_save_dataset(
+                    dataset,
+                    output_dir,
+                    push_to_hub,
+                    split,
+                    allowed_instruments,
+                    cfg,
+                    console,
+                    parquet_shard_dir=parquet_shard_dir,
+                    parquet_compression=parquet_compression,
+                    generate_readme=generate_readme,
                 )
-            except Exception as e:
-                logger.warning(
-                    "Efficient loading failed (%s), falling back to legacy method.", e
-                )
-                all_rows = load_all_rows_from_jsonl(rows_jsonl_file)
-                if not all_rows:
-                    click.echo("No rows found in JSONL file.")
-                    return
-                dataset = all_rows
-                click.echo(f"Loaded {len(all_rows)} existing rows using legacy method.")
-
-            _build_and_save_dataset(
-                dataset,
-                output_dir,
-                push_to_hub,
-                split,
-                allowed_instruments,
-                cfg,
-                console,
-                parquet_export=parquet_export,
-                parquet_compression=parquet_compression,
-                parquet_output_dir=parquet_output_dir,
-                generate_readme=generate_readme,
-            )
+            except FileNotFoundError:
+                click.echo("No Parquet shards found. Nothing to do.")
         return
 
     # ── Lazy-init heavy models ─────────────────────────────────────────────────
     separator = None
     if separate_stems:
+        click.echo("Loading Demucs model ...", nl=False)
         try:
             from auto_charter.audio.separator import StemSeparator
 
@@ -689,46 +937,58 @@ def main(
                 segment=None,
                 shifts=1,
             )
+            click.echo(" done.")
         except ImportError as e:
-            click.echo(
-                f"WARNING: Cannot load Demucs ({e}). Stem separation disabled.",
-                err=True,
-            )
+            click.echo(f" FAILED ({e}). Stem separation disabled.", err=True)
             separator = None
 
     mert_extractor = None
     if extract_mert:
+        click.echo(f"Loading MERT model ({mert_model}) ...", nl=False)
         try:
             from auto_charter.audio.mert_extractor import MERTExtractor
 
             mert_extractor = MERTExtractor(model_name=mert_model, device=device)
-            click.echo("MERT model loaded once.")
+            click.echo(" done.")
         except ImportError as e:
-            click.echo(
-                f"WARNING: Cannot load MERT ({e}). MERT extraction disabled.", err=True
-            )
+            click.echo(f" FAILED ({e}). MERT extraction disabled.", err=True)
 
     logmel_extractor = None
     if do_logmel:
+        click.echo("Initializing log-mel extractor ...", nl=False)
         try:
             from auto_charter.audio.logmel import LogMelExtractor
 
             logmel_extractor = LogMelExtractor(n_mels=128, target_frames=32)
+            click.echo(" done.")
         except ImportError as e:
-            click.echo(
-                f"WARNING: Cannot load librosa ({e}). Log-mel extraction disabled.",
-                err=True,
-            )
+            click.echo(f" FAILED ({e}). Log-mel extraction disabled.", err=True)
 
     # ── Process songs ──────────────────────────────────────────────────────────
+    # Initialise Parquet shard writer
+    if parquet_shard_dir is not None:
+        shard_writer = ParquetShardWriter(
+            output_dir=parquet_shard_dir,
+            split=split,
+            compression=parquet_compression,
+        )
+        click.echo(f"Writing directly to Parquet shards in {parquet_shard_dir}")
+
     n_passed = 0
     n_failed = 0
     n_skipped = 0
+    n_rows_ok = 0
+    n_rows_dropped_logmel = 0
+    n_rows_dropped_mert = 0
+    n_demucs_used = 0
     total_notes = 0
+    fail_reasons: dict[str, int] = {}
     t_pipeline_start = time.perf_counter()
+    _PROGRESS_INTERVAL = 10  # print a status line every N songs
 
     def _run_songs(song_list: list[Path]):
-        nonlocal n_passed, n_failed, n_skipped, total_notes
+        nonlocal n_passed, n_failed, n_skipped, n_rows_ok
+        nonlocal n_rows_dropped_logmel, n_rows_dropped_mert, n_demucs_used, total_notes
 
         if _RICH:
             progress = Progress(
@@ -743,8 +1003,9 @@ def main(
             )
             task = progress.add_task("Processing songs", total=len(song_list))
 
+        total_songs = len(song_list)
         with progress if _RICH else _dummy_ctx() as prog:
-            for song_dir in song_list:
+            for idx, song_dir in enumerate(song_list, 1):
                 desc = song_dir.name[:50]
                 if _RICH:
                     progress.update(task, description=f"[cyan]{desc}")
@@ -759,15 +1020,26 @@ def main(
 
                 if result.error:
                     n_failed += 1
+                    # Bucket errors by their prefix (e.g. "midi parse error", "chart parse error")
+                    bucket = result.error.split(":")[0].strip()
+                    fail_reasons[bucket] = fail_reasons.get(bucket, 0) + 1
                     logger.warning("FAIL  %s — %s", song_dir.name, result.error)
                 elif result.skipped:
                     n_skipped += 1
                     logger.debug("SKIP  %s", song_dir.name)
                 else:
                     n_passed += 1
-                    # Save rows incrementally
-                    if rows_jsonl_file:
-                        save_rows_to_jsonl(result.rows, rows_jsonl_file)
+                    if result.separation_done:
+                        n_demucs_used += 1
+                    # Count dropped rows (filtered out in process_song for missing audio features)
+                    expected_rows = len([
+                        i for i in cfg.instruments
+                        if i in result.rows[0].get("instrument", "") or True
+                    ]) if result.rows else 0
+                    n_rows_ok += len(result.rows)
+
+                    if shard_writer is not None:
+                        shard_writer.add(result.rows)
                     if checkpoint_file:
                         save_processed_song(song_dir, checkpoint_file)
 
@@ -783,6 +1055,27 @@ def main(
                         sep_tag,
                     )
 
+                # Periodic plain-text status (visible even without Rich)
+                if idx % _PROGRESS_INTERVAL == 0 or idx == total_songs:
+                    pct = idx / total_songs * 100
+                    elapsed = time.perf_counter() - t_pipeline_start
+                    rate = idx / elapsed if elapsed > 0 else 0
+                    eta = (total_songs - idx) / rate if rate > 0 else 0
+                    click.echo(
+                        f"[{idx:>6}/{total_songs}  {pct:5.1f}%]  "
+                        f"ok={n_passed}  fail={n_failed}  skip={n_skipped}  "
+                        f"rows={n_rows_ok}  notes={total_notes:,}  "
+                        f"eta={eta/60:.1f}min"
+                    )
+
+                # Release any cached GPU memory between songs
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
                 if _RICH:
                     progress.advance(task)
 
@@ -795,37 +1088,47 @@ def main(
         table = Table(title="Processing Summary", show_header=True)
         table.add_column("Metric", style="bold")
         table.add_column("Value", justify="right")
-        table.add_row("Songs processed", str(n_passed))
+        table.add_row("Songs OK", str(n_passed))
         table.add_row("Songs failed", str(n_failed))
-        table.add_row("Songs skipped", str(n_skipped))
+        table.add_row("Songs skipped (no chart)", str(n_skipped))
+        table.add_row("Rows saved", str(n_rows_ok))
+        table.add_row("Demucs separations", str(n_demucs_used))
         table.add_row("Total notes", f"{total_notes:,}")
         table.add_row("Pipeline time", f"{pipeline_duration:.1f}s")
+        if fail_reasons:
+            table.add_section()
+            for reason, count in sorted(fail_reasons.items(), key=lambda x: -x[1]):
+                table.add_row(f"  {reason}", str(count))
         console.print(table)
     else:
-        click.echo(f"Processed: {n_passed}  Failed: {n_failed}  Skipped: {n_skipped}")
+        click.echo(f"Songs   ok={n_passed}  fail={n_failed}  skip={n_skipped}")
+        click.echo(f"Rows saved : {n_rows_ok}")
+        click.echo(f"Demucs used: {n_demucs_used}")
         click.echo(f"Total notes: {total_notes:,}")
         click.echo(f"Pipeline time: {pipeline_duration:.1f}s")
+        if fail_reasons:
+            click.echo("Failure breakdown:")
+            for reason, count in sorted(fail_reasons.items(), key=lambda x: -x[1]):
+                click.echo(f"  {count:>6}x  {reason}")
 
-    # ── Build Dataset from JSONL ───────────────────────────────────────────────
-    if output_dir and rows_jsonl_file and rows_jsonl_file.exists():
-        # Try efficient loading first, fall back to legacy method if needed
+    # ── Flush remaining shard buffer and build final dataset ───────────────────
+    if shard_writer is not None:
+        total_written = shard_writer.close()
+        shards = shard_writer.shard_paths()
+        click.echo(f"\nFlushed {total_written} rows across {len(shards)} Parquet shard(s).")
+
+        if not shards:
+            click.echo("ERROR: No rows were written. Dataset not saved.", err=True)
+            sys.exit(1)
+
+        click.echo("Loading dataset from Parquet shards ...")
         try:
-            dataset = load_dataset_from_jsonl(rows_jsonl_file)
-            if len(dataset) == 0:
-                click.echo("\nERROR: No rows found in JSONL file.", err=True)
-                sys.exit(1)
-            click.echo(f"Loaded {len(dataset)} rows efficiently from JSONL.")
+            dataset = load_dataset_from_parquet_shards(parquet_shard_dir, split)
         except Exception as e:
-            logger.warning(
-                "Efficient loading failed (%s), falling back to legacy method.", e
-            )
-            all_rows = load_all_rows_from_jsonl(rows_jsonl_file)
-            if not all_rows:
-                click.echo("\nERROR: No rows found in JSONL file.", err=True)
-                sys.exit(1)
-            dataset = all_rows
-            click.echo(f"Loaded {len(all_rows)} rows using legacy method.")
+            click.echo(f"ERROR loading Parquet shards: {e}", err=True)
+            sys.exit(1)
 
+        click.echo(f"Loaded {len(dataset)} rows.")
         _build_and_save_dataset(
             dataset,
             output_dir,
@@ -834,14 +1137,13 @@ def main(
             allowed_instruments,
             cfg,
             console,
-            parquet_export=parquet_export,
+            parquet_shard_dir=parquet_shard_dir,
             parquet_compression=parquet_compression,
-            parquet_output_dir=parquet_output_dir,
             generate_readme=generate_readme,
         )
     elif not output_dir and push_to_hub:
         click.echo(
-            "ERROR: --push-to-hub requires --output-dir to store intermediate JSONL.",
+            "ERROR: --push-to-hub requires --output-dir.",
             err=True,
         )
         sys.exit(1)
@@ -857,47 +1159,14 @@ def _build_and_save_dataset(
     instruments,
     cfg,
     console,
-    parquet_export=False,
+    parquet_shard_dir=None,
     parquet_compression="zstd",
-    parquet_output_dir=None,
     generate_readme=True,
 ):
-    """Build HuggingFace Dataset from all_rows and save/push with optional Parquet export and README generation."""
-    click.echo("\nBuilding HuggingFace dataset ...")
-    try:
-        from datasets import Dataset
-    except ImportError:
-        click.echo("ERROR: datasets is required: pip install datasets", err=True)
-        sys.exit(1)
+    """Save dataset to Arrow format and push to Hub. Parquet shards are already written."""
+    from datasets import Dataset
 
-    # Handle input: could be list[dict], Dataset, or Path to JSONL
-    if isinstance(all_rows, (str, Path)):
-        # Load dataset directly from JSONL without intermediate list
-        try:
-            from auto_charter.dataset.schema import get_features
-
-            features = get_features()
-            dataset = Dataset.from_json(str(all_rows), features=features)
-        except Exception as e:
-            logger.warning(
-                "Could not load dataset from JSONL with schema (%s) — loading without schema.",
-                e,
-            )
-            dataset = Dataset.from_json(str(all_rows))
-    elif isinstance(all_rows, Dataset):
-        dataset = all_rows
-    else:
-        # Assume list[dict]
-        try:
-            from auto_charter.dataset.schema import get_features
-
-            features = get_features()
-            dataset = Dataset.from_list(all_rows, features=features)
-        except Exception as e:
-            logger.warning(
-                "Could not apply typed schema (%s) — building untyped dataset.", e
-            )
-            dataset = Dataset.from_list(all_rows)
+    dataset = all_rows if isinstance(all_rows, Dataset) else Dataset.from_list(all_rows)
 
     click.echo(f"Dataset: {dataset}")
     _print_dataset_stats(dataset, instruments)
@@ -909,35 +1178,9 @@ def _build_and_save_dataset(
         dataset.save_to_disk(str(save_path))
         click.echo(f"\nSaved Arrow dataset to {save_path}")
 
-        # Export to Parquet if requested
-        if parquet_export:
-            parquet_dir = Path(parquet_output_dir) if parquet_output_dir else out_path
-            parquet_dir.mkdir(parents=True, exist_ok=True)
-            parquet_path = parquet_dir / f"{split}.parquet"
-            try:
-                import pandas as pd
-
-                df = dataset.to_pandas()
-                df.to_parquet(
-                    parquet_path, compression=parquet_compression, engine="pyarrow"
-                )
-                click.echo(
-                    f"Exported Parquet dataset to {parquet_path} (compression: {parquet_compression})"
-                )
-
-                # Also save schema separately for reference
-                schema_path = parquet_dir / f"{split}_schema.json"
-                import json
-
-                schema = (
-                    {str(k): str(type(v).__name__) for k, v in df.iloc[0].items()}
-                    if len(df) > 0
-                    else {}
-                )
-                schema_path.write_text(json.dumps(schema, indent=2))
-            except Exception as e:
-                logger.warning("Failed to export Parquet dataset: %s", e)
-                click.echo(f"WARNING: Parquet export failed: {e}")
+        if parquet_shard_dir:
+            shards = sorted(Path(parquet_shard_dir).glob(f"{split}-*.parquet"))
+            click.echo(f"Parquet shards: {len(shards)} file(s) in {parquet_shard_dir}")
 
         # Generate README.md dataset card if requested
         if generate_readme:
@@ -955,12 +1198,10 @@ def _build_and_save_dataset(
             "num_rows": len(dataset),
             "instruments": instruments,
             "extract_mert": cfg.extract_mert,
-            "extract_logmel": True,  # we don't have flag here, but can be inferred
+            "extract_logmel": True,
             "separate_stems": cfg.separate_stems,
-            "demucs_model": cfg.mert_model if cfg.separate_stems else None,
-            "parquet_export": parquet_export,
-            "parquet_compression": parquet_compression if parquet_export else None,
-            "generate_readme": generate_readme,
+            "parquet_compression": parquet_compression,
+            "parquet_shard_dir": str(parquet_shard_dir) if parquet_shard_dir else None,
         }
         manifest_path = out_path / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))

@@ -51,6 +51,57 @@ _INSTR_TO_DEMUCS: dict[str, str] = {v: k for k, v in _DEMUCS_TO_INSTR.items()}
 _INSTR_TO_DEMUCS["guitar"] = "other"  # explicit override
 
 
+def _load_audio_robust(audio_path: Path):
+    """Load audio file as a torchaudio tensor, falling back to ffmpeg if needed.
+
+    torchaudio's default backends (soundfile/sox) don't reliably decode .opus
+    files even when the file is valid. ffmpeg handles virtually all formats.
+
+    Returns:
+        (wav, sr): wav is [C, T] float32 tensor, sr is the sample rate.
+    """
+    import subprocess
+    import tempfile
+    import torchaudio
+
+    # First try torchaudio directly (fast path for .ogg/.mp3/.wav)
+    try:
+        wav, sr = torchaudio.load(str(audio_path))
+        return wav, sr
+    except Exception as direct_err:
+        logger.debug(
+            "torchaudio direct load failed for '%s' (%s) — trying ffmpeg fallback.",
+            audio_path.name, direct_err,
+        )
+
+    # ffmpeg fallback: decode to a temporary WAV file
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(audio_path),
+            "-ar", "44100",   # standard sample rate
+            "-ac", "2",       # stereo
+            "-f", "wav", tmp_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed: {result.stderr.decode(errors='replace')}"
+            )
+
+        wav, sr = torchaudio.load(tmp_path)
+        return wav, sr
+    finally:
+        import os
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 class StemSeparator:
     """Separate a stereo mix into instrument stems using Demucs htdemucs.
 
@@ -143,8 +194,10 @@ class StemSeparator:
         # Run Demucs
         model = self._load_model()
 
-        # Load audio with torchaudio
-        wav, sr = torchaudio.load(str(audio_path))  # [C, T]
+        # Load audio with torchaudio.
+        # Some formats (e.g. .opus) are not reliably decoded by torchaudio's
+        # default backend. If loading fails, fall back to ffmpeg → WAV conversion.
+        wav, sr = _load_audio_robust(audio_path)  # [C, T]
         if sr != model.samplerate:
             wav = torchaudio.functional.resample(wav, sr, model.samplerate)
         # Ensure stereo
@@ -238,11 +291,12 @@ def resolve_or_separate(
                 result[instr] = p
         return result
 
-    # Source audio for Demucs (prefer song.ogg, then any .ogg)
-    mix_path = song_dir / "song.ogg"
-    if not mix_path.exists():
-        all_ogg = sorted(song_dir.glob("*.ogg"))
-        mix_path = all_ogg[0] if all_ogg else None
+    # Source audio for Demucs (prefer song.ogg/mp3/wav, then any audio file)
+    from auto_charter.audio.stem_loader import _find_audio, find_all_audio
+    mix_path = _find_audio(song_dir, "song") or _find_audio(song_dir, "music")
+    if mix_path is None:
+        all_audio = find_all_audio(song_dir)
+        mix_path = all_audio[0] if all_audio else None
 
     if mix_path is None:
         logger.warning("No audio file found in %s — skipping Demucs.", song_dir)

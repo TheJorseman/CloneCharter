@@ -100,6 +100,7 @@ class AutoCharterTrainer:
         collator = AutoCharterTrainCollator(
             max_tokens=self.config.max_seq_len,
             max_beats=self.config.max_beats,
+            mert_dim=self.config.mert_dim,
         )
 
         self._raw_train_dataset = train_dataset  # keep ref for evict_all / set_epoch
@@ -256,11 +257,26 @@ class AutoCharterTrainer:
     # ── Private methods ────────────────────────────────────────────────────────
 
     def _train_epoch(self, epoch: int) -> float:
+        from tqdm import tqdm
+
         self.model.train()
         total_loss = 0.0
         n_steps = 0
 
-        for batch in self.train_loader:
+        try:
+            total_batches = len(self.train_loader)
+        except TypeError:
+            total_batches = None
+
+        pbar = tqdm(
+            self.train_loader,
+            total=total_batches,
+            desc=f"Epoch {epoch}",
+            disable=not self.accelerator.is_main_process,
+            dynamic_ncols=True,
+        )
+
+        for batch in pbar:
             with self.accelerator.accumulate(self.model):
                 output = self.model(
                     mert_embeddings=batch["mert_embeddings"],
@@ -313,6 +329,10 @@ class AutoCharterTrainer:
 
             total_loss += loss.detach().float().item()
             n_steps += 1
+            if self.accelerator.is_main_process:
+                pbar.set_postfix(loss=f"{loss.detach().float().item():.4f}", step=self.global_step)
+
+        pbar.close()
 
         return total_loss / max(n_steps, 1)
 

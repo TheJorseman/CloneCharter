@@ -64,7 +64,8 @@ class LogMelExtractor:
         Returns:
             Float32 array [T_frames, n_mels].
         """
-        y, _ = librosa.load(str(audio_path), sr=self.sr, mono=True)
+        from auto_charter.audio.audio_io import load_audio
+        y = load_audio(audio_path, sr=self.sr, mono=True)
         mel = librosa.feature.melspectrogram(
             y=y,
             sr=self.sr,

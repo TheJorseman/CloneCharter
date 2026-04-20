@@ -36,10 +36,13 @@ Dependencies: mido
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from .chart_parser import ChartData, NoteEvent, SpecialEvent
 from .sync_track import BPMEvent, BPMMap, TimeSigEvent
+
+logger = logging.getLogger(__name__)
 
 try:
     import mido
@@ -93,7 +96,11 @@ def parse_midi(path: str | Path) -> ChartData:
         raise ImportError("mido is required for MIDI parsing: pip install mido")
 
     path = Path(path)
-    mid = mido.MidiFile(str(path))
+    try:
+        mid = mido.MidiFile(str(path), clip=True)
+    except Exception:
+        # clip=True not available in older mido versions — fall back without it
+        mid = mido.MidiFile(str(path))
     tpb = mid.ticks_per_beat
 
     data = ChartData(resolution=TARGET_RESOLUTION)
@@ -151,6 +158,14 @@ def parse_midi(path: str | Path) -> ChartData:
                 is_on = msg.type == "note_on" and velocity > 0
                 chart_tick = _norm_tick(abs_tick, tpb)
 
+                # Clamp out-of-range MIDI pitches (malformed files)
+                if not (0 <= pitch <= 127):
+                    logger.debug(
+                        "Clamping out-of-range MIDI pitch %d in track '%s'",
+                        pitch, track_name_raw,
+                    )
+                    pitch = max(0, min(127, pitch))
+
                 # Star power note
                 if pitch == _STAR_POWER_PITCH:
                     if is_on:
@@ -171,6 +186,11 @@ def parse_midi(path: str | Path) -> ChartData:
                     chart_pitch = _DRUM_MIDI_TO_CHART.get(pitch)
 
                 if chart_pitch is None:
+                    # Log unexpected pitches at debug level to help diagnose non-standard charts
+                    logger.debug(
+                        "Ignoring unmapped pitch %d in track '%s' (instrument='%s')",
+                        pitch, track_name_raw, instrument,
+                    )
                     continue
 
                 key = (instrument, pitch)

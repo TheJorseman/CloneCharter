@@ -65,10 +65,12 @@ class AutoCharterTrainCollator:
         pad_token_id: int = Vocab.PAD,
         max_tokens: int = 16384,
         max_beats: int = 1024,
+        mert_dim: int = 1024,
     ) -> None:
         self.pad_token_id = pad_token_id
         self.max_tokens = max_tokens
         self.max_beats = max_beats
+        self.mert_dim = mert_dim
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Tensor]:
         B = len(batch)
@@ -108,19 +110,18 @@ class AutoCharterTrainCollator:
         max_beats_batch = max(m.shape[0] for m in mert_list) if mert_list else 0
         max_beats_batch = max(max_beats_batch, 1)  # avoid zero-size
 
-        # Use max dim across the batch — handles datasets with mixed MERT model versions
-        mert_dim = max((m.shape[1] for m in mert_list if m.ndim >= 2 and m.shape[0] > 0), default=1024)
+        # Always allocate to model's target dims — zero-pad rows with smaller embeddings
         logmel_shape = next((lm.shape[1:] for lm in logmel_list if lm.ndim >= 3 and lm.shape[0] > 0), (32, 128))
 
-        mert_array = np.zeros((B, max_beats_batch, mert_dim), dtype=np.float32)
+        mert_array = np.zeros((B, max_beats_batch, self.mert_dim), dtype=np.float32)
         logmel_array = np.zeros((B, max_beats_batch, *logmel_shape), dtype=np.float32)
         beat_mask = np.zeros((B, max_beats_batch), dtype=np.bool_)
 
         for i, (m, lm) in enumerate(zip(mert_list, logmel_list)):
             nb = m.shape[0]
             if nb > 0:
-                d = m.shape[1]  # actual mert dim for this row (may be < mert_dim)
-                mert_array[i, :nb, :d] = m
+                d = min(m.shape[1], self.mert_dim)  # clip if row exceeds target dim
+                mert_array[i, :nb, :d] = m[:, :d]
                 lm_shape = lm.shape[1:]
                 logmel_array[i, :nb, :lm_shape[0], :lm_shape[1]] = lm
                 beat_mask[i, :nb] = True
