@@ -30,7 +30,7 @@ def _make_batch(batch_size: int, max_tokens: int, max_beats: int, vocab_size: in
         "time_sig_num":       torch.full((B, N), 4, device=device, dtype=torch.long),
         "time_sig_den":       torch.full((B, N), 4, device=device, dtype=torch.long),
         "beat_duration_s":    torch.full((B, N), 0.5, device=device),
-        "beat_attention_mask": torch.ones(B, N, device=device, dtype=torch.bool),
+        "beat_padding_mask":   torch.ones(B, N, device=device, dtype=torch.bool),
         "input_ids":          torch.randint(0, vocab_size, (B, T), device=device),
         "beat_ids":           torch.arange(T, device=device).unsqueeze(0).expand(B, -1) % N,
         "instrument_ids":     torch.zeros(B, device=device, dtype=torch.long),
@@ -43,7 +43,20 @@ def _try_batch(model, batch, amp_dtype, device) -> bool:
     """Returns True if forward+backward fits in memory."""
     try:
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            out = model(**batch)
+            out = model(
+                mert_embeddings=batch["mert_embeddings"],
+                logmel_frames=batch["logmel_frames"],
+                bpm_at_beat=batch["bpm_at_beat"],
+                time_sig_num=batch["time_sig_num"],
+                time_sig_den=batch["time_sig_den"],
+                beat_duration_s=batch["beat_duration_s"],
+                beat_padding_mask=batch["beat_padding_mask"],
+                input_ids=batch["input_ids"],
+                beat_ids=batch["beat_ids"],
+                instrument_ids=batch["instrument_ids"],
+                difficulty_ids=batch["difficulty_ids"],
+                labels=batch["labels"],
+            )
             out.loss.backward()
         model.zero_grad(set_to_none=True)
         return True
