@@ -28,6 +28,7 @@ import click
 @click.command()
 @click.option("--dataset", "-d", default=None, type=click.Path(), help="Path to local parquet shards directory")
 @click.option("--hub-dataset", default=None, help="HuggingFace Hub dataset ID (e.g. user/dataset)")
+@click.option("--streaming", is_flag=True, help="Load shards lazily (ShardIndexedDataset) to keep RAM bounded. Required for local parquet shards.")
 @click.option("--val-shards", default=5, type=int, show_default=True, help="Number of shards reserved for validation")
 @click.option("--shuffle-buffer", default=200, type=int, show_default=True, help="Shuffle buffer size when streaming from Hub")
 @click.option("--max-shards-in-memory", default=2, type=int, show_default=True, help="Max parquet shards in RAM at once")
@@ -54,7 +55,7 @@ import click
 @click.option("--resume-from", default=None, type=click.Path())
 @click.option("--steps-per-epoch", default=0, type=int, show_default=True, help="Override steps/epoch for LR schedule (0 = auto)")
 def main(
-    dataset, hub_dataset, val_shards, shuffle_buffer, max_shards_in_memory,
+    dataset, hub_dataset, streaming, val_shards, shuffle_buffer, max_shards_in_memory,
     output_dir, d_model, n_enc_layers, n_dec_layers, n_heads, d_ff,
     dropout, batch_size, grad_accum, num_epochs, lr, warmup_steps, patience,
     max_tokens, max_beats, use_wandb, mixed_precision, num_workers,
