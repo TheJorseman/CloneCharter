@@ -12,12 +12,25 @@ from typing import Optional
 from auto_charter.parsers.chart_parser import ChartData, NoteEvent, SpecialEvent
 
 
-# Canonical instrument name → ExpertXxx section name
-_INSTR_TO_SECTION: dict[str, str] = {
-    "guitar": "ExpertSingle",
-    "bass": "ExpertDoubleBass",
-    "drums": "ExpertDrums",
-    "rhythm": "ExpertDoubleRhythm",
+# Canonical instrument name + difficulty → section name
+_INSTR_DIFF_TO_SECTION: dict[tuple[str, int], str] = {
+    # Guitar
+    ("guitar", 0): "EasySingle",    ("guitar", 1): "MediumSingle",
+    ("guitar", 2): "HardSingle",    ("guitar", 3): "ExpertSingle",
+    ("guitar", 4): "ExpertSingle",  ("guitar", 5): "ExpertSingle",
+    ("guitar", 6): "ExpertSingle",
+    # Bass
+    ("bass", 0): "EasyDoubleBass",    ("bass", 1): "MediumDoubleBass",
+    ("bass", 2): "HardDoubleBass",    ("bass", 3): "ExpertDoubleBass",
+    ("bass", 4): "ExpertDoubleBass",  ("bass", 5): "ExpertDoubleBass",
+    ("bass", 6): "ExpertDoubleBass",
+    # Drums
+    ("drums", 0): "EasyDrums",    ("drums", 1): "MediumDrums",
+    ("drums", 2): "HardDrums",    ("drums", 3): "ExpertDrums",
+    ("drums", 4): "ExpertDrums",  ("drums", 5): "ExpertDrums",
+    ("drums", 6): "ExpertDrums",
+    # Rhythm
+    ("rhythm", 3): "ExpertDoubleRhythm",
 }
 
 
@@ -30,6 +43,7 @@ def render_chart(
     album: str = "",
     year: int = 0,
     charter: str = "auto-charter",
+    diff_by_instr: dict[str, int] | None = None,
 ) -> str:
     """Convert a ChartData object to .chart file text.
 
@@ -59,7 +73,7 @@ def render_chart(
         parts.append(f'  Year = ", {year}"')
     parts.append(f'  Charter = "{charter}"')
     parts.append(f"  Resolution = {resolution}")
-    parts.append("  MusicStream = song.ogg")
+    parts.append('  MusicStream = "song.ogg"')
     parts.append("}")
     parts.append("")
 
@@ -93,15 +107,19 @@ def render_chart(
     parts.append("")
 
     # ── Instrument tracks ──────────────────────────────────────────────────────
-    for instr, notes in chart_data.tracks.items():
+    def _base_instr(key: str) -> str:
+        return key.rsplit("_", 1)[0] if "_" in key else key
+
+    for track_key, notes in chart_data.tracks.items():
         if not notes:
             continue
 
-        section = _INSTR_TO_SECTION.get(instr)
+        diff_id = (diff_by_instr or {}).get(track_key, 3)
+        section = _INSTR_DIFF_TO_SECTION.get((_base_instr(track_key), diff_id))
         if section is None:
-            continue
+            section = _INSTR_DIFF_TO_SECTION.get((_base_instr(track_key), 3), "ExpertSingle")
 
-        is_drums = instr == "drums"
+        is_drums = _base_instr(track_key) == "drums"
 
         parts.append(f"[{section}]")
         parts.append("{")
@@ -126,7 +144,7 @@ def render_chart(
                     events.append((tick, f"  {tick} = N 6 0"))
 
         # Star power specials
-        specials_for_instr = chart_data.specials.get(instr, [])
+        specials_for_instr = chart_data.specials.get(track_key, [])
         for sp in specials_for_instr:
             if sp.kind == "star_power":
                 events.append((sp.tick, f"  {sp.tick} = S 2 {sp.length}"))

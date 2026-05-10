@@ -19,3 +19,4 @@ checkpoints/
 # HPC job files
 train.*
 Caos - La Planta/
+outputs/

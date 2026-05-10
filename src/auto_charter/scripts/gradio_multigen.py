@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import urllib.request
 from pathlib import Path
 
 import click
@@ -39,6 +40,44 @@ _DIFF_LABEL_TO_ID   = {
 }
 _DIFF_ID_TO_LABEL   = {v: k for k, v in _DIFF_LABEL_TO_ID.items()}
 _DIFF_PRIORITY      = {3: 0, 4: 0, 5: 0, 6: 0, 2: 1, 1: 2, 0: 3}
+
+
+# ── Metadata helpers ────────────────────────────────────────────────────────────
+
+def fetch_metadata_itunes(artist: str, song: str) -> dict | None:
+    """Fetch album metadata from iTunes Search API. Returns dict or None."""
+    import requests
+    try:
+        resp = requests.get(
+            "https://itunes.apple.com/search",
+            params={"term": f"{song} {artist}", "entity": "song", "limit": 1},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if not results:
+            return None
+        t = results[0]
+        artwork = t.get("artworkUrl100", "").replace("100x100", "600x600")
+        return {
+            "album":   t.get("collectionName", ""),
+            "year":    t.get("releaseDate", "")[:4],
+            "genre":   t.get("primaryGenreName", ""),
+            "artwork": artwork,
+        }
+    except Exception:
+        return None
+
+
+def download_album_art(url: str, dest: Path) -> bool:
+    """Download album artwork to dest. Returns True on success."""
+    if not url:
+        return False
+    try:
+        urllib.request.urlretrieve(url, dest)
+        return True
+    except Exception:
+        return False
 
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
@@ -57,7 +96,10 @@ def run_pipeline(
     temperature: float = 0.95,
     top_p: float = 0.92,
     max_new_tokens: int = 8192,
+    use_demucs: bool = True,
     log=print,
+    cancel_event=None,
+    artwork_path: Path | None = None,
 ) -> tuple[str, Path | None]:
     """Full generation pipeline. Returns (status, zip_path | None)."""
 
@@ -96,16 +138,24 @@ def run_pipeline(
     needed_instrs = list({instr for instr, _ in targets})
     tmpdir = Path(tempfile.mkdtemp(prefix="autocharter_"))
 
+    # Persist ZIP in a stable location so Gradio can serve it
+    output_dir = Path("./outputs").resolve()
+    output_dir.mkdir(exist_ok=True)
+
     try:
-        # ── 1. Stem separation ────────────────────────────────────────────────
-        log("🎸 Separando stems con Demucs ...")
-        stems_dir = tmpdir / "stems"
-        try:
-            stem_paths = StemSeparator(device=device).separate(
-                audio_path, stems_dir, instruments=needed_instrs
-            )
-        except Exception as e:
-            log(f"  ⚠ Demucs falló ({e}). Usando audio original.")
+        # ── 1. Stem separation (opcional) ─────────────────────────────────────
+        if use_demucs:
+            log("🎸 Separando stems con Demucs ...")
+            stems_dir = tmpdir / "stems"
+            try:
+                stem_paths = StemSeparator(device=device).separate(
+                    audio_path, stems_dir, instruments=needed_instrs
+                )
+            except Exception as e:
+                log(f"  ⚠ Demucs falló ({e}). Usando audio original.")
+                stem_paths = {i: audio_path for i in needed_instrs}
+        else:
+            log("🎸 Usando audio completo (sin Demucs) ...")
             stem_paths = {i: audio_path for i in needed_instrs}
 
         for instr, p in stem_paths.items():
@@ -148,6 +198,10 @@ def run_pipeline(
         model.eval()
         with torch.no_grad():
             for instr, diff_id in targets:
+                if cancel_event is not None and cancel_event.is_set():
+                    log("⚠ Cancelado por el usuario.")
+                    return "Cancelado por el usuario.", None
+
                 feat = feat_cache[instr]
                 log(f"  {instr}/{_DIFF_ID_TO_LABEL.get(diff_id, diff_id)} ...")
                 tokens = model.generate(
@@ -176,24 +230,27 @@ def run_pipeline(
         bpm_map.bpm_events = [BPMEvent(tick=0, bpm=feat_cache[first_instr]["bpm_mean"])]
         combined.bpm_map = bpm_map
 
-        # Sort by priority (highest difficulty first per instrument)
-        sorted_targets = sorted(targets, key=lambda t: _DIFF_PRIORITY.get(t[1], 99))
-        seen: set[str] = set()
+        # Keep highest difficulty per instrument (targets are sorted best-first)
         diff_by_instr: dict[str, int] = {}
 
-        for instr, diff_id in sorted_targets:
+        for instr, diff_id in targets:
             tokens = generated[(instr, diff_id)]
             instr_bpm = BPMMap(resolution=192)
             instr_bpm.bpm_events = [BPMEvent(tick=0, bpm=feat_cache[instr]["bpm_mean"])]
             chart = decode_tokens(tokens, resolution=192, bpm_map=instr_bpm)
 
-            all_notes = [n for notes in chart.tracks.values() for n in notes]
-            if instr not in seen:
-                combined.tracks[instr]   = all_notes
-                combined.specials[instr] = [sp for sps in chart.specials.values() for sp in sps]
-                seen.add(instr)
-                diff_by_instr[instr] = diff_id
-                log(f"  {instr} ({_DIFF_ID_TO_LABEL.get(diff_id)}): {len(all_notes)} notas")
+            # Log what the decoder found in each track
+            log(f"  [DEBUG] decode_tokens for {instr}/{diff_id}: tracks={list(chart.tracks.keys())}, "
+                f"notes_per_track={[len(v) for v in chart.tracks.values()]}")
+
+            notes_for_instr = chart.tracks.get(instr, [])
+            track_key = f"{instr}_{diff_id}"
+            # Replace track only if this diff is higher priority than existing
+            if track_key not in diff_by_instr or _DIFF_PRIORITY.get(diff_id, 99) < _DIFF_PRIORITY.get(diff_by_instr[track_key], 99):
+                combined.tracks[track_key]   = notes_for_instr
+                combined.specials[track_key] = chart.specials.get(instr, [])
+                diff_by_instr[track_key] = diff_id
+                log(f"  {instr}/{_DIFF_ID_TO_LABEL.get(diff_id)}: {len(notes_for_instr)} notas")
 
         # ── 5. Render notes.chart ─────────────────────────────────────────────
         chart_text = render_chart(
@@ -204,6 +261,7 @@ def run_pipeline(
             album=album,
             year=year_int,
             charter="auto-charter",
+            diff_by_instr=diff_by_instr,
         )
 
         # ── 6. Audio → song.ogg ───────────────────────────────────────────────
@@ -238,6 +296,13 @@ def run_pipeline(
         except Exception:
             song_length_ms = 0
 
+        # Extract best difficulty per base instrument for song.ini
+        ini_diffs = {}
+        for track_key, diff_id in diff_by_instr.items():
+            base = track_key.rsplit("_", 1)[0]
+            if base not in ini_diffs or _DIFF_PRIORITY.get(diff_id, 99) < _DIFF_PRIORITY.get(ini_diffs[base], 99):
+                ini_diffs[base] = diff_id
+
         ini_lines = [
             "[Song]",
             f"name = {song_name or 'Unknown'}",
@@ -249,18 +314,22 @@ def run_pipeline(
         if song_length_ms: ini_lines.append(f"song_length = {song_length_ms}")
         ini_lines += [
             "charter = auto-charter",
-            f"diff_guitar = {diff_by_instr.get('guitar', -1)}",
-            f"diff_bass = {diff_by_instr.get('bass', -1)}",
-            f"diff_drums = {diff_by_instr.get('drums', -1)}",
-            f"MusicStream = {audio_filename}",
+            f"diff_guitar = {ini_diffs.get('guitar', -1)}",
+            f"diff_bass = {ini_diffs.get('bass', -1)}",
+            f"diff_drums = {ini_diffs.get('drums', -1)}",
+            f'MusicStream = "{audio_filename}"',
         ]
         ini_text = "\n".join(ini_lines)
 
         (pkg_dir / "notes.chart").write_text(chart_text, encoding="utf-8")
         (pkg_dir / "song.ini").write_text(ini_text, encoding="utf-8")
 
+        # ── 7b. Album artwork ───────────────────────────────────────────────────
+        if artwork_path and artwork_path.exists():
+            shutil.copy2(artwork_path, pkg_dir / "album.png")
+
         # ── 8. ZIP ────────────────────────────────────────────────────────────
-        zip_path = tmpdir / f"{safe_name}.zip"
+        zip_path = output_dir / f"{safe_name}.zip"
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for f in pkg_dir.iterdir():
                 zf.write(f, arcname=f"{safe_name}/{f.name}")
@@ -272,7 +341,7 @@ def run_pipeline(
         status = (
             f"✓ Generado: '{song_name}' — {tracks_summary}\n"
             f"BPM≈{feat_cache[first_instr]['bpm_mean']:.1f} | "
-            f"ZIP: {size_mb:.1f} MB | {len(seen)} track(s)"
+            f"ZIP: {size_mb:.1f} MB | {len(diff_by_instr)} track(s)"
         )
         log(f"\n{status}")
         return status, zip_path
@@ -289,6 +358,7 @@ def run_pipeline(
 def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
     import gradio as gr
     import torch
+    import threading
     from auto_charter.model.charter_model import AutoCharterModel
 
     if device == "auto":
@@ -300,13 +370,37 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
     model = model.to(device)
     print(f"Modelo listo ({model.num_parameters():,} parámetros).")
 
+    # Shared state for cancellation
+    cancel_event = threading.Event()
+    artwork_cache: dict[str, Path] = {}
+
+    def _on_sync(song_name, artist):
+        if not song_name or not artist:
+            return "", "", "", gr.update(visible=False)
+        meta = fetch_metadata_itunes(artist, song_name)
+        if meta is None:
+            return "", "", "", gr.update(visible=False)
+        art_path = Path(tempfile.gettempdir()) / f"autocharter_art_{hash((artist, song_name))}.png"
+        downloaded = download_album_art(meta["artwork"], art_path)
+        if downloaded:
+            artwork_cache["current"] = art_path
+            return (
+                meta["album"],
+                meta["genre"],
+                meta["year"],
+                gr.update(value=str(art_path), visible=True),
+            )
+        return meta["album"], meta["genre"], meta["year"], gr.update(visible=False)
+
     def _on_generate(
         audio_file,
         song_name, artist, album, genre, year,
         instrument_checks, difficulty_checks,
         temperature, top_p, max_new_tokens,
+        use_demucs,
         progress=gr.Progress(),
     ):
+        cancel_event.clear()
         log_lines: list[str] = []
 
         def _log(msg: str) -> None:
@@ -321,6 +415,7 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
             return "Por favor sube un archivo de audio.", gr.update(visible=False)
 
         audio_path = Path(audio_file if isinstance(audio_file, str) else audio_file.name)
+        art_path = artwork_cache.get("current")
 
         status, zip_path = run_pipeline(
             audio_path        = audio_path,
@@ -336,13 +431,21 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
             temperature       = float(temperature),
             top_p             = float(top_p),
             max_new_tokens    = int(max_new_tokens),
+            use_demucs        = use_demucs,
             log               = _log,
+            cancel_event      = cancel_event,
+            artwork_path      = art_path,
         )
 
         full_status = status + "\n\n── Log ──\n" + "\n".join(log_lines)
-        if zip_path and zip_path.exists():
-            return full_status, gr.update(value=str(zip_path), visible=True)
+        zip_path_str = str(zip_path.resolve()) if zip_path and zip_path.exists() else None
+        if zip_path_str:
+            return full_status, gr.update(value=zip_path_str, visible=True)
         return full_status, gr.update(visible=False)
+
+    def _on_cancel():
+        cancel_event.set()
+        return "⚠ Solicitud de cancelación enviada."
 
     # ── Layout ────────────────────────────────────────────────────────────────
     with gr.Blocks(title="Auto-Charter", theme=gr.themes.Soft()) as demo:
@@ -355,9 +458,11 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
         with gr.Row():
             # ── Columna izquierda — entrada ───────────────────────────────────
             with gr.Column(scale=1):
-                audio_input = gr.File(
+                audio_input = gr.Audio(
+                    type="filepath",
                     label="Audio (.ogg / .mp3 / .wav)",
-                    file_types=[".ogg", ".mp3", ".wav"],
+                    sources=["upload"],
+                    interactive=True,
                 )
 
                 gr.Markdown("### Instrumentos")
@@ -365,6 +470,12 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
                     choices=["Guitar", "Bass", "Drums"],
                     value=["Guitar"],
                     label="Seleccionar instrumentos",
+                )
+
+                use_demucs_checkbox = gr.Checkbox(
+                    value=True,
+                    label="Usar Demucs (separar stems por instrumento)",
+                    info="Si está desactivado se usa el audio completo para todos los instrumentos",
                 )
 
                 gr.Markdown("### Dificultades")
@@ -387,16 +498,21 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
                         value=8192, label="Max tokens por track", precision=0,
                     )
 
-                generate_btn = gr.Button("🎵 Generar Chart", variant="primary", size="lg")
+                with gr.Row():
+                    generate_btn = gr.Button("🎵 Generar Chart", variant="primary", size="lg")
+                    cancel_btn   = gr.Button("⏹ Cancelar", variant="stop", size="lg")
 
             # ── Columna derecha — metadatos ───────────────────────────────────
             with gr.Column(scale=1):
                 gr.Markdown("### Metadatos de la canción")
-                song_name_input = gr.Textbox(label="Nombre de la canción", placeholder="Mi Canción")
-                artist_input    = gr.Textbox(label="Artista",              placeholder="Artista")
+                with gr.Row():
+                    song_name_input = gr.Textbox(label="Nombre de la canción", placeholder="Mi Canción", scale=2)
+                    artist_input    = gr.Textbox(label="Artista",              placeholder="Artista", scale=2)
+                sync_btn = gr.Button("🔄 Sincronizar", size="sm", scale=1)
                 album_input     = gr.Textbox(label="Álbum",                placeholder="Álbum (opcional)")
                 genre_input     = gr.Textbox(label="Género",               placeholder="Rock")
                 year_input      = gr.Textbox(label="Año",                  placeholder="2024", value="")
+                album_art_input = gr.Image(label="Carátula del álbum", interactive=False, visible=False)
 
                 gr.Markdown("### Resultado")
                 status_box = gr.Textbox(
@@ -405,8 +521,8 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
                     interactive=False,
                     placeholder="El estado aparecerá aquí tras la generación...",
                 )
-                download_btn = gr.File(
-                    label="⬇ Descargar .zip (arrastrar a carpeta de Clone Hero)",
+                download_btn = gr.DownloadButton(
+                    "⬇ Descargar .zip — arrástralo a la carpeta Songs de Clone Hero",
                     visible=False,
                 )
 
@@ -417,14 +533,27 @@ def build_app(checkpoint_path: str, device: str = "auto") -> "gr.Blocks":
                 song_name_input, artist_input, album_input, genre_input, year_input,
                 instrument_checks, difficulty_checks,
                 temperature_slider, top_p_slider, max_tokens_input,
+                use_demucs_checkbox,
             ],
             outputs=[status_box, download_btn],
+        )
+
+        sync_btn.click(
+            fn=_on_sync,
+            inputs=[song_name_input, artist_input],
+            outputs=[album_input, genre_input, year_input, album_art_input],
+        )
+
+        cancel_btn.click(
+            fn=_on_cancel,
+            inputs=[],
+            outputs=[status_box],
         )
 
         gr.Markdown(
             "---\n"
             "**Notas:**\n"
-            "- La separación de stems (Demucs) puede tardar 1–3 min en CPU.\n"
+            "- La separación de stems (Demucs) puede tardar 1–3 min en CPU. Desactívala si prefieres usar el audio completo.\n"
             "- MERT requiere ~4 GB VRAM; en CPU es más lento pero funciona.\n"
             "- Nucleus sampling (T=0.95, top-p=0.92) ofrece la mejor calidad.\n"
             "- El ZIP contiene `notes.chart`, `song.ini` y `song.ogg` en una "
