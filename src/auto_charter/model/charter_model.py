@@ -203,10 +203,31 @@ class AutoCharterModel(nn.Module):
 
     @classmethod
     def from_pretrained(cls, path: Path | str) -> "AutoCharterModel":
-        path = Path(path)
+        from pathlib import Path as _Path
+        path = _Path(path)
+
+        # Support loading from HuggingFace Hub repo ID (e.g. "thejorseman/CloneCharter")
+        if not path.exists():
+            from huggingface_hub import hf_hub_download
+            config_file = hf_hub_download(repo_id=str(path), filename="config.json")
+            path = _Path(config_file).parent
+
         config = AutoCharterConfig.load(path / "config.json")
         model = cls(config)
-        state = torch.load(path / "model.pt", map_location="cpu", weights_only=True)
+
+        # Prefer safetensors over .pt (safer, faster)
+        st_path = path / "model.safetensors"
+        pt_path = path / "model.pt"
+        if st_path.exists():
+            from safetensors.torch import load_file as st_load
+            state = st_load(str(st_path), device="cpu")
+        elif pt_path.exists():
+            state = torch.load(pt_path, map_location="cpu", weights_only=True)
+        else:
+            raise FileNotFoundError(
+                f"No se encontró model.safetensors ni model.pt en {path}"
+            )
+
         model.load_state_dict(state)
         return model
 

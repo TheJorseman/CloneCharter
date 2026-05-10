@@ -11,4 +11,11 @@ wheels/
 .ruff_cache
 .pytest_cache
 .claude
+
+# Data & model weights
+dataset/
+checkpoints/
+
+# HPC job files
+train.*
 Caos - La Planta/
